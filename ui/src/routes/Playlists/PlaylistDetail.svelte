@@ -216,8 +216,9 @@
     showImportInput = false;
   }
 
-  function handleDragOver(e: DragEvent): void {
+  function acceptUrlDrag(e: DragEvent): void {
     e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
     dragOver = true;
   }
 
@@ -307,7 +308,8 @@
 <div
   class="page-playlist-detail"
   class:drag-active={dragOver}
-  on:dragover={handleDragOver}
+  on:dragenter={acceptUrlDrag}
+  on:dragover={acceptUrlDrag}
   on:dragleave={handleDragLeave}
   on:drop={handleDrop}
 >
