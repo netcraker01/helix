@@ -228,10 +228,31 @@
   async function handleDrop(e: DragEvent): Promise<void> {
     e.preventDefault();
     dragOver = false;
-    // Try text data from the drop — works for URLs dragged from the browser
-    const text = e.dataTransfer?.getData('text') || e.dataTransfer?.getData('text/uri-list') || '';
-    if (text) {
-      await importYouTubeTrack(text);
+    if (!e.dataTransfer) return;
+
+    // Try multiple MIME types — different platforms deliver dragged URLs
+    // differently. WebKitGTK uses 'text', WebView2 (Windows) often uses
+    // 'text/uri-list' or 'text/html' (an <a> tag with the URL in href).
+    const candidates = [
+      e.dataTransfer.getData('text/uri-list'),
+      e.dataTransfer.getData('text/x-moz-url'),
+      e.dataTransfer.getData('text'),
+      e.dataTransfer.getData('text/plain'),
+    ];
+
+    // Also try extracting a URL from text/html (Windows drops <a href="...">)
+    const html = e.dataTransfer.getData('text/html');
+    if (html) {
+      const match = html.match(/href=["']([^"']+)["']/i);
+      if (match) candidates.push(match[1]);
+    }
+
+    for (const candidate of candidates) {
+      const url = candidate?.trim();
+      if (url) {
+        await importYouTubeTrack(url);
+        return;
+      }
     }
   }
 </script>
