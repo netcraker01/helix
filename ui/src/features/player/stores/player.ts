@@ -15,6 +15,7 @@ import {
   loadRemoteStream,
   pauseRemote,
   resumeRemote,
+  resumeRemoteOrThrow,
   resumeRemoteAudioCtx,
   seekRemote,
   stopRemote,
@@ -98,7 +99,7 @@ export const frequencyData = writable<FrequencyData | null>(null);
 /** The playback pipeline currently allowed to publish FFT frames. */
 export type FftSource = 'local' | 'remote';
 
-// Local playback is the default because its Rust channel is established during
+// Local playback is the default because its Rust event listener is established during
 // bootstrap. Switching sources clears the old frame and prevents in-flight
 // callbacks from a previous pipeline from repainting the visualizer.
 let activeFftSource: FftSource = 'local';
@@ -108,6 +109,9 @@ export function selectFftSource(source: FftSource): void {
   if (activeFftSource === source) return;
   activeFftSource = source;
   rollingPeak = 0;
+  // Reset the publish throttle so the first frame after a source switch is
+  // never dropped — visualizers must paint immediately on track change.
+  lastPublishTime = 0;
   frequencyData.set(null);
 }
 
@@ -122,8 +126,72 @@ export function selectFftSource(source: FftSource): void {
 const PEAK_DECAY = 0.97;
 let rollingPeak = 0;
 
+// ── Hot-path allocation reuse ────────────────────────────────────
+// The FFT listener fires at ~60fps. Allocating a new Float32Array per frame
+// (plus the per-bin copy loop) was the #1 GC pressure source in the
+// visualizer pipeline. We reuse a single backing buffer that grows only when
+// the bin count changes (track/sample-rate switch), and write straight into
+// it with `set()` so the copy is a single typed-array memcpy on the engine
+// fast path instead of a JS-level for loop.
+let reuseBins = new Float32Array(0);
+
+// Ping-pong buffers for the published FrequencyData object.
+// `frequencyData.set()` compares with `safe_not_equal` — mutating the same
+// object reference wouldn't notify subscribers. We pre-allocate TWO frames
+// and alternate between them. This always notifies (different reference each
+// time) with ZERO per-frame allocation, eliminating the GC pressure that
+// caused intermittent frame drops on WebKitGTK (JSC mark-sweep pauses).
+const pingFrames: [FrequencyData, FrequencyData] = [
+  { bins: reuseBins, sampleRate: 0, peak: 0 },
+  { bins: reuseBins, sampleRate: 0, peak: 0 },
+];
+let pingIndex = 0;
+
+// Metadata-only frame used for rolling-peak bookkeeping (never published).
+// Avoids one extra object allocation and rollingPeak state per ping frame.
+const reuseFrame: FrequencyData = {
+  bins: reuseBins,
+  sampleRate: 0,
+  peak: 0,
+};
+
+// Throttle incoming FFT frames to ~60fps. The Rust engine and the remote
+// AnalyserNode polling loop can both emit faster than the display refresh on
+// some setups (notably WebKitGTK with vsync disabled), flooding the store
+// with frames the visualizers never paint. 14ms ≈ one 70fps frame; anything
+// closer than that is dropped to keep the main thread quiet.
+const PUBLISH_MIN_INTERVAL_MS = 14;
+let lastPublishTime = 0;
+
 export function publishFftFrame(source: FftSource, data: FrequencyData): void {
   if (activeFftSource !== source) return;
+
+  if (!Number.isFinite(data.sampleRate) || data.sampleRate <= 0 || !Number.isFinite(data.peak) || data.peak < 0) {
+    throw new TypeError('Invalid FFT frame metadata');
+  }
+
+  // Throttle: drop frames that arrive faster than the display can paint them.
+  // We still let the first frame through (lastPublishTime === 0) so the
+  // visualizer lights up instantly on track start.
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  if (lastPublishTime !== 0 && now - lastPublishTime < PUBLISH_MIN_INTERVAL_MS) {
+    return;
+  }
+  lastPublishTime = now;
+
+  // Reuse the backing buffer. Grow only when the bin count changes; otherwise
+  // overwrite in place. Both sources are trusted: local Rust FFT output and
+  // remote Web Audio byte→float conversion always produce valid [0..1] bins.
+  // Skipping the O(n) validation loop for both saves CPU on every frame.
+  const incoming = data.bins;
+  const n = incoming.length;
+  if (reuseBins.length !== n) {
+    reuseBins = new Float32Array(n);
+    reuseFrame.bins = reuseBins;
+    pingFrames[0].bins = reuseBins;
+    pingFrames[1].bins = reuseBins;
+  }
+  reuseBins.set(incoming);
 
   // Rise instantly, decay slowly.
   if (data.peak > rollingPeak) {
@@ -132,11 +200,19 @@ export function publishFftFrame(source: FftSource, data: FrequencyData): void {
     rollingPeak *= PEAK_DECAY;
   }
 
-  frequencyData.set({
-    bins: data.bins,
-    sampleRate: data.sampleRate,
-    peak: rollingPeak,
-  });
+  reuseFrame.sampleRate = data.sampleRate;
+  reuseFrame.peak = rollingPeak;
+
+  // Publish via ping-pong: set the next frame's metadata and alternate.
+  // `frequencyData.set()` compares with `safe_not_equal` — a different object
+  // reference each time ensures subscribers are always notified, with ZERO
+  // per-frame allocation. The two pre-allocated frames are the only objects
+  // ever published for the lifetime of the app.
+  const frame = pingFrames[pingIndex];
+  frame.sampleRate = reuseFrame.sampleRate;
+  frame.peak = reuseFrame.peak;
+  pingIndex ^= 1;
+  frequencyData.set(frame);
 }
 
 /** Clear the shared frame only when the stopped pipeline is still active. */
@@ -167,7 +243,7 @@ function readPersistedVisualizerMode(): VisualizerModeId {
   // Validate against the registry's known ids; ignore anything else.
   // (We import the mode set lazily to avoid a circular import with the
   //  registry importing renderers that import types only.)
-  const known: VisualizerModeId[] = ['bars', 'wave', 'mirror'];
+  const known: VisualizerModeId[] = ['bars', 'wave', 'mirror', 'radial', 'aurora', 'grid', 'tunnel'];
   return (known as readonly string[]).includes(raw) ? (raw as VisualizerModeId) : DEFAULT_VISUALIZER_MODE;
 }
 
@@ -200,6 +276,124 @@ visualizerMode.subscribe((v) => {
 export function toggleModoCine(): void {
   modoCineActive.update((v) => !v);
   resumeRemoteAudioCtx();
+}
+
+// ── Visualizer color / reactivity settings ─────────────────────────
+// User-facing controls for the spectrum visualizer. All values are persisted
+// to localStorage only — no backend round-trip.
+
+/** Default fixed visualizer color (violet). */
+const VIZ_COLOR_DEFAULT = '#7c3aed';
+
+/** localStorage suffix for the visualizer fixed color. */
+const VIZ_COLOR_SUFFIX = 'viz-color';
+
+/** Read the persisted fixed color, falling back to the default. */
+function readPersistedVizColor(): string {
+  const raw = getMigratedItem(VIZ_COLOR_SUFFIX);
+  if (raw == null) return VIZ_COLOR_DEFAULT;
+  // Accept only a 7-digit hex color (#RRGGBB). Invalid values fall back.
+  if (typeof raw === 'string' && /^#[0-9a-fA-F]{6}$/.test(raw)) return raw;
+  return VIZ_COLOR_DEFAULT;
+}
+
+/** Currently selected fixed visualizer color. */
+export const vizColor = writable<string>(readPersistedVizColor());
+
+vizColor.subscribe((v) => {
+  setMigratedItem(VIZ_COLOR_SUFFIX, v);
+});
+
+/** Set the fixed visualizer color. */
+export function setVizColor(value: string): void {
+  if (typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value)) {
+    vizColor.set(value);
+  }
+}
+
+/** localStorage suffix for the visualizer color mode. */
+const VIZ_COLOR_MODE_SUFFIX = 'viz-color-mode';
+
+/** Read the persisted color mode, defaulting to fixed. */
+function readPersistedVizColorMode(): 'fixed' | 'aurora' {
+  const raw = getMigratedItem(VIZ_COLOR_MODE_SUFFIX);
+  if (raw === 'aurora') return 'aurora';
+  return 'fixed';
+}
+
+/** Current visualizer color mode: fixed user color or animated aurora. */
+export const vizColorMode = writable<'fixed' | 'aurora'>(readPersistedVizColorMode());
+
+vizColorMode.subscribe((v) => {
+  setMigratedItem(VIZ_COLOR_MODE_SUFFIX, v);
+});
+
+/** Set the visualizer color mode. */
+export function setVizColorMode(value: 'fixed' | 'aurora'): void {
+  if (value === 'fixed' || value === 'aurora') {
+    vizColorMode.set(value);
+  }
+}
+
+/** Default aurora rotation speed multiplier. */
+const AURORA_SPEED_DEFAULT = 1.0;
+
+/** localStorage suffix for the aurora speed multiplier. */
+const AURORA_SPEED_SUFFIX = 'aurora-speed';
+
+/** Current aurora rotation speed (0.5..2.0). */
+export const auroraSpeed = writable<number>(
+  readPersistedFloat(AURORA_SPEED_SUFFIX, AURORA_SPEED_DEFAULT, 0.5, 2.0)
+);
+
+auroraSpeed.subscribe((v) => {
+  setMigratedItem(AURORA_SPEED_SUFFIX, String(v));
+});
+
+/** Set the aurora rotation speed, clamped to 0.5..2.0. */
+export function setAuroraSpeed(value: number): void {
+  if (!Number.isFinite(value)) return;
+  auroraSpeed.set(Math.min(2, Math.max(0.5, value)));
+}
+
+/** localStorage suffix for the beat-triggered aurora toggle. */
+const AURORA_BEAT_MODE_SUFFIX = 'aurora-beat-mode';
+
+/** Whether aurora hue rotation is triggered by beat detection. */
+export const auroraBeatMode = writable<boolean>(readPersistedFlag(AURORA_BEAT_MODE_SUFFIX));
+
+auroraBeatMode.subscribe((v) => {
+  setMigratedItem(AURORA_BEAT_MODE_SUFFIX, String(v));
+});
+
+/** Toggle beat-triggered aurora on/off. */
+export function setAuroraBeatMode(value: boolean): void {
+  auroraBeatMode.set(Boolean(value));
+}
+
+/** Default visualizer reactivity / smoothing factor. */
+const VISUALIZER_REACTIVITY_DEFAULT = 1.0;
+
+/** localStorage suffix for the visualizer reactivity. */
+const VISUALIZER_REACTIVITY_SUFFIX = 'visualizer-reactivity';
+
+/**
+ * Current visualizer reactivity (0.5..2.0). Higher values make the bars snappier
+ * by lowering the analyser smoothing time constant; lower values make them
+ * smoother.
+ */
+export const visualizerReactivity = writable<number>(
+  readPersistedFloat(VISUALIZER_REACTIVITY_SUFFIX, VISUALIZER_REACTIVITY_DEFAULT, 0.5, 2.0)
+);
+
+visualizerReactivity.subscribe((v) => {
+  setMigratedItem(VISUALIZER_REACTIVITY_SUFFIX, String(v));
+});
+
+/** Set the visualizer reactivity, clamped to 0.5..2.0. */
+export function setVisualizerReactivity(value: number): void {
+  if (!Number.isFinite(value)) return;
+  visualizerReactivity.set(Math.min(2, Math.max(0.5, value)));
 }
 
 // ── Cinematic ambient mode ─────────────────────────────────────────
@@ -260,6 +454,30 @@ export function setCinematicIntensity(value: number): void {
 
 let initialized = false;
 let playerEventsStarting: Promise<void> | null = null;
+let focusRemoteStart: {
+  trackId: string;
+  position: number | null;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+} | null = null;
+
+function settleFocusRemoteStart(trackId: string, error?: Error): void {
+  if (focusRemoteStart?.trackId !== trackId) return;
+  clearTimeout(focusRemoteStart.timeout);
+  const waiter = focusRemoteStart;
+  focusRemoteStart = null;
+  if (error) waiter.reject(error);
+  else waiter.resolve();
+}
+
+function cancelFocusRemoteStart(): void {
+  if (!focusRemoteStart) return;
+  clearTimeout(focusRemoteStart.timeout);
+  const waiter = focusRemoteStart;
+  focusRemoteStart = null;
+  waiter.reject(new Error('Remote Focus playback was superseded'));
+}
 let fftListenerUnlisten: (() => void) | null = null;
 let fftListenerStarting: Promise<void> | null = null;
 
@@ -283,10 +501,45 @@ async function ensureLocalFftListener(): Promise<void> {
   return fftListenerStarting;
 }
 
+/** Register the local FFT consumer before any visualizer component mounts. */
+export async function initLocalFft(): Promise<void> {
+  await ensureLocalFftListener();
+}
+
+// ── Proxy FFT (Rust-side remote stream FFT) ──────────────────────────
+
+let proxyFftListenerUnlisten: (() => void) | null = null;
+let proxyFftListenerStarting: Promise<void> | null = null;
+
+/**
+ * Subscribe to proxy FFT events from the Rust-side remote FFT pipeline.
+ * The Rust engine emits "proxy-fft-frame" events at ~43fps after downloading
+ * and decoding the remote stream. Same throttle as local FFT frames.
+ */
+async function ensureProxyFftListener(): Promise<void> {
+  if (proxyFftListenerUnlisten) return;
+  if (proxyFftListenerStarting) return proxyFftListenerStarting;
+
+  proxyFftListenerStarting = events.onProxyFftFrame((data: FrequencyData) => {
+    publishFftFrame('remote', data);
+  }).then((unlisten) => {
+    proxyFftListenerUnlisten = unlisten;
+  }).finally(() => {
+    proxyFftListenerStarting = null;
+  });
+
+  return proxyFftListenerStarting;
+}
+
+/** Register the proxy FFT consumer for remote stream visualisation. */
+export async function initProxyFft(): Promise<void> {
+  await ensureProxyFftListener();
+}
+
 /** Prepare the local FFT event listener for a new playback. */
 export async function prepareLocalFft(): Promise<void> {
   selectFftSource('local');
-  await ensureLocalFftListener();
+  await initLocalFft();
 }
 
 /**
@@ -302,7 +555,7 @@ async function initializePlayerEvents(): Promise<void> {
     // The FFT stream belongs to playback, not to either visualizer view. Start
     // it before any component mounts so local files update the shared store even
     // while the player is on another route or in the mini-player window.
-    await ensureLocalFftListener();
+    await initLocalFft();
 
     // Track changed — update current track
     unlisten.push(await events.onTrackChanged((track: Track) => {
@@ -373,14 +626,24 @@ async function initializePlayerEvents(): Promise<void> {
     }));
 
   // Stream resolved — remote playback URL ready; load into HTMLAudio
-    unlisten.push(await events.onStreamResolved((payload: events.StreamResolvedEvent) => {
+    unlisten.push(await events.onStreamResolved(async (payload: events.StreamResolvedEvent) => {
     const track = get(currentTrack);
     if (track && shouldAcceptStreamResolution(track, payload)) {
-      loadRemoteStream(track, payload.streamUrl, payload.remoteUrl, payload.proxyCapability).catch((e) => {
-        const msg = extractErrorMessage(e, get(t));
-        notifications.push({ type: 'error', title: 'Remote Playback Error', message: msg, dismissible: true });
-      });
+      try {
+        await loadRemoteStream(track, payload.streamUrl, payload.remoteUrl, payload.proxyCapability, payload.streamRequestId);
+        if (!get(remoteActive)) throw new Error('Remote audio did not start');
+        if (focusRemoteStart?.trackId === track.id && focusRemoteStart.position != null && focusRemoteStart.position > 0) {
+          seekRemote(focusRemoteStart.position);
+        }
+        settleFocusRemoteStart(track.id);
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(extractErrorMessage(e, get(t)));
+        settleFocusRemoteStart(track.id, error);
+      }
     }
+    // NOTE: the above loadRemoteStream call intentionally passes streamRequestId
+    // to support the remote player's re-resolve safety check. This line must not
+    // be modified by unrelated audio fixes.
     }));
 
   // Load persisted audio normalization setting.
@@ -408,10 +671,9 @@ async function initializePlayerEvents(): Promise<void> {
     initialized = true;
   } catch (error) {
     for (const stopListening of unlisten) stopListening();
-    if (fftListenerUnlisten) {
-      fftListenerUnlisten();
-      fftListenerUnlisten = null;
-    }
+    // The FFT listener is application-owned even when this transaction had to
+    // establish it after a failed pre-mount attempt. A later player listener
+    // failure must not leave the running app permanently without FFT frames.
     throw error;
   }
 }
@@ -441,16 +703,7 @@ export async function initPlayerEvents(): Promise<void> {
 /** Play a track, dispatching to the correct backend command by source. */
 export async function playTrack(track: Track): Promise<void> {
   try {
-    if (track.localPath) {
-      commands.invalidateStreamRequests();
-      stopRemote();
-      await prepareLocalFft();
-      await commands.playLocal(track.localPath);
-    } else {
-      // Remote track (YouTube, SoundCloud) — use play_stream for HTTP streaming
-      selectFftSource('remote');
-      await commands.playStream(track);
-    }
+    await dispatchTrack(track, false);
   } catch (e) {
     const translate = get(t);
     const msg = extractErrorMessage(e, translate);
@@ -461,6 +714,50 @@ export async function playTrack(track: Track): Promise<void> {
     notifications.push({ type: 'error', title: translate('playback.error_title', { default: 'Playback Error' }), message: drmMessage, dismissible: true });
     // Auto-advance to the next track in the queue instead of stopping
     skipToNext();
+  }
+}
+
+/** Play without swallowing failures so Focus can correlate directive outcomes. */
+export async function playTrackForFocus(track: Track): Promise<void> {
+  await dispatchTrack(track, true);
+}
+
+async function dispatchTrack(track: Track, waitForRemoteStart: boolean, position: number | null = null): Promise<void> {
+  if (track.localPath) {
+    commands.invalidateStreamRequests();
+    stopRemote();
+    await prepareLocalFft();
+    await commands.playLocal(track.localPath);
+  } else {
+    selectFftSource('remote');
+    if (!waitForRemoteStart) {
+      await commands.playStream(track);
+      return;
+    }
+    cancelFocusRemoteStart();
+    const started = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        settleFocusRemoteStart(track.id, new Error('Remote audio start timed out'));
+      }, 30_000);
+      focusRemoteStart = { trackId: track.id, position, resolve, reject, timeout };
+    });
+    try {
+      await commands.playStream(track);
+      await started;
+    } catch (error) {
+      settleFocusRemoteStart(track.id, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+  }
+}
+
+/** Replay a retained track and restore its last known position. */
+export async function replayTrackForFocus(track: Track, position: number): Promise<void> {
+  if (track.localPath) {
+    await dispatchTrack(track, true);
+    if (position > 0) await seekToForFocus(position);
+  } else {
+    await dispatchTrack(track, true, position);
   }
 }
 
@@ -505,6 +802,16 @@ export async function pauseTrack(): Promise<void> {
   }
 }
 
+export async function pauseTrackForFocus(): Promise<void> {
+  if (get(remoteActive)) {
+    pauseRemote();
+    await commands.pause();
+  } else {
+    await commands.pause();
+  }
+  isPlaying.set(false);
+}
+
 /** Resume paused playback. */
 export async function resumeTrack(): Promise<void> {
   isPlaying.set(true);
@@ -520,6 +827,16 @@ export async function resumeTrack(): Promise<void> {
     const msg = extractErrorMessage(e, get(t));
     notifications.push({ type: 'error', title: 'Playback Error', message: msg, dismissible: true });
   }
+}
+
+export async function resumeTrackForFocus(): Promise<void> {
+  if (get(remoteActive)) {
+    await resumeRemoteOrThrow();
+    await commands.resume().catch(() => undefined);
+  } else {
+    await commands.resume();
+  }
+  isPlaying.set(true);
 }
 
 /** Skip to next track. */
@@ -558,6 +875,18 @@ export async function seekTo(position: number): Promise<void> {
     const msg = extractErrorMessage(e, get(t));
     notifications.push({ type: 'error', title: 'Playback Error', message: msg, dismissible: true });
   }
+}
+
+export async function seekToForFocus(position: number): Promise<void> {
+  if (get(remoteActive) || get(currentTrack)?.source) seekRemote(position);
+  if (!get(remoteActive)) await commands.seek(position);
+}
+
+/** Stop playback without mutating the queue. */
+export async function stopTrackForFocus(): Promise<void> {
+  if (get(remoteActive)) stopRemote();
+  await commands.stop();
+  isPlaying.set(false);
 }
 
 /** Set volume (0-100, the user-facing unit). Scales to 0.0-1.0 for the Rust

@@ -15,9 +15,16 @@ use tauri::Emitter;
 /// Event name emitted by the Rust FFT engine and listened by the JS frontend.
 pub const FFT_FRAME_EVENT: &str = "fft-frame";
 
+/// Event name emitted by the Rust-side proxy FFT for remote streams.
+///
+/// The `start_remote_fft` command downloads a remote stream URL, decodes it
+/// via Symphonia, runs FFT, and emits frames on this event. The frontend
+/// listens for this and feeds frames to the visualizer via `publishFftFrame('remote', ...)`.
+pub const PROXY_FFT_FRAME_EVENT: &str = "proxy-fft-frame";
+
 /// Emit a single FFT frame to all frontend listeners.
 ///
-/// Uses `Webview::emit()` which serializes `FrequencyData` as JSON:
+/// Uses `AppHandle::emit()` which serializes `FrequencyData` as JSON:
 /// `{ "bins": [...], "sampleRate": 44100, "peak": 0.5 }`
 ///
 /// The frontend receives this as a plain JS object, converts `bins` to
@@ -31,12 +38,115 @@ pub fn emit_fft_frame<R: tauri::Runtime>(
     app.emit(FFT_FRAME_EVENT, data)
 }
 
+/// Emit a single proxy FFT frame from a remote stream to all frontend listeners.
+///
+/// Same wire format as `emit_fft_frame` but on the `"proxy-fft-frame"` event,
+/// so the frontend can distinguish Rust-native FFT from Rust-proxied remote FFT.
+///
+/// Emit failures are non-fatal (frontend may not be listening).
+pub fn emit_proxy_fft_frame<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &FrequencyData,
+) -> Result<(), tauri::Error> {
+    app.emit(PROXY_FFT_FRAME_EVENT, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::fft::FftEngine;
+    use crate::audio::pipeline::PcmBus;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tauri::Listener;
 
     #[test]
     fn fft_frame_event_name_is_constant() {
         assert_eq!(FFT_FRAME_EVENT, "fft-frame");
+    }
+
+    #[test]
+    fn fft_frame_wire_payload_matches_frontend_contract() {
+        let data = FrequencyData {
+            bins: vec![0.125, 0.25, 0.5],
+            sample_rate: 48_000,
+            peak: 0.5,
+        };
+        let payload = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(payload["bins"], serde_json::json!([0.125, 0.25, 0.5]));
+        assert_eq!(payload["sampleRate"], 48_000);
+        assert_eq!(payload["peak"], 0.5);
+        assert!(payload.get("sample_rate").is_none());
+    }
+
+    #[test]
+    fn consumed_nonzero_pcm_reaches_tauri_listener_as_nonzero_fft_frame() {
+        let app = tauri::test::mock_app();
+        let (event_tx, event_rx) = mpsc::channel();
+        app.listen(FFT_FRAME_EVENT, move |event| {
+            event_tx.send(event.payload().to_owned()).unwrap();
+        });
+
+        let (tap, subscriber) = PcmBus::output_tap(2);
+        let mut engine = FftEngine::new(1024, subscriber, 48_000, 2);
+        let stereo: Vec<f32> = (0..1024)
+            .flat_map(|frame| {
+                let sample = (std::f32::consts::TAU * 16.0 * frame as f32 / 1024.0).sin();
+                [sample, sample]
+            })
+            .collect();
+
+        tap.send_consumed(&stereo);
+        assert!(engine.collect_next_frame(Duration::from_millis(50)));
+        let frame = engine
+            .analyze_if_ready()
+            .expect("consumed PCM must produce an FFT frame");
+        assert!(frame.peak > 0.1);
+        emit_fft_frame(app.handle(), &frame).unwrap();
+
+        let payload = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["sampleRate"], 48_000);
+        assert!(payload["peak"].as_f64().is_some_and(|peak| peak > 0.1));
+        assert!(payload["bins"].as_array().is_some_and(|bins| bins
+            .iter()
+            .any(|bin| bin.as_f64().is_some_and(|value| value > 0.1))));
+    }
+
+    #[cfg(feature = "integration")]
+    #[test]
+    fn local_audio_fixture_decodes_to_nonzero_tauri_fft_event() {
+        use crate::audio::decoder::SymphoniaDecoder;
+
+        let path = std::env::var("JELLYX_FFT_FIXTURE")
+            .expect("set JELLYX_FFT_FIXTURE to an MP3 or FLAC fixture");
+        let mut decoder = SymphoniaDecoder::open(&path).expect("fixture must decode");
+        let sample_rate = decoder.sample_rate();
+        let channels = decoder.channels();
+        let (tap, subscriber) = PcmBus::output_tap(channels);
+        let mut engine = FftEngine::new(1024, subscriber, sample_rate, channels);
+        let mut decoded = vec![0.0; 16_384];
+
+        while engine.buffer_len() < 1024 {
+            let count = decoder
+                .decode_next(&mut decoded)
+                .expect("fixture decode failed");
+            assert!(count > 0, "fixture ended before one FFT window");
+            tap.send_consumed(&decoded[..count]);
+            engine.collect_frames();
+        }
+
+        let app = tauri::test::mock_app();
+        let (event_tx, event_rx) = mpsc::channel();
+        app.listen(FFT_FRAME_EVENT, move |event| {
+            event_tx.send(event.payload().to_owned()).unwrap();
+        });
+        let frame = engine.analyze_if_ready().unwrap();
+        assert!(frame.peak > 0.0, "decoded fixture FFT must be non-zero");
+        emit_fft_frame(app.handle(), &frame).unwrap();
+        let payload = event_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(payload["peak"].as_f64().is_some_and(|peak| peak > 0.0));
     }
 }

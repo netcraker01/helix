@@ -46,6 +46,10 @@ export function resume(): Promise<void> {
   return invokeCommand<void>('resume');
 }
 
+export function stop(): Promise<void> {
+  return invokeCommand<void>('stop');
+}
+
 export function next(): Promise<void> {
   return invokeCommand<void>('next');
 }
@@ -83,6 +87,27 @@ export function searchGrouped(query: string, filter?: string, offset?: number, l
 /** Get full artist detail by artist ID. */
 export function getArtistDetail(id: string): Promise<ArtistDetail> {
   return invokeCommand<ArtistDetail>('get_artist_detail', { id });
+}
+
+/** Read the cached artist detail JSON for an artist id, or null if uncached.
+ *  Used by the SWR store to render cached data immediately while a refresh
+ *  runs in the background. */
+export function getCachedArtistDetail(id: string): Promise<ArtistDetail | null> {
+  return invokeCommand<ArtistDetail | null>('get_cached_artist_detail', { id });
+}
+
+/** Authoritative artist-detail refresh. Fetches from local + enabled remote
+ *  sources, deduplicates by source/sourceId, preserves cached tracks from
+ *  sources that failed this refresh, stores the fresh result in the cache,
+ *  and clears the refresh-start marker. */
+export function refreshArtistDetail(id: string): Promise<ArtistDetail> {
+  return invokeCommand<ArtistDetail>('refresh_artist_detail', { id });
+}
+
+/** Favorite artist IDs whose cached detail is stale (older than 6 hours) or
+ *  missing. Used by the app startup warmer to pre-warm stale favorites. */
+export function getStaleFavoriteArtistIds(): Promise<string[]> {
+  return invokeCommand<string[]>('get_stale_favorite_artist_ids');
 }
 
 /** Get full album detail by album ID. */
@@ -270,6 +295,22 @@ export function resolveTrack(source: string, id: string): Promise<Track> {
 /** Pre-resolve the next track's stream URL for instant playback. */
 export function prefetchNextStream(): Promise<void> {
   return invokeCommand<void>('prefetch_next_stream');
+}
+
+/** Re-resolve a track's stream URL, bypassing the resolver cache. */
+export function reResolveStream(track: Track, streamRequestId: number): Promise<{ streamUrl: string; proxyCapability?: string }> {
+  return invokeCommand<{ streamUrl: string; proxyCapability?: string }>('re_resolve_stream', { track, streamRequestId });
+}
+
+/** Start Rust-side FFT analysis for a remote stream URL.
+ *
+ * Downloads the remote audio, decodes it via Symphonia, and emits
+ * `"proxy-fft-frame"` events at the audio's native frame rate. The
+ * frontend listens for these events and feeds them to the visualizer.
+ * This replaces the unreliable WebKitGTK AnalyserNode for remote streams.
+ */
+export function startRemoteFft(url: string): Promise<void> {
+  return invokeCommand<void>('start_remote_fft', { url });
 }
 
 // ── User Playlist commands ────────────────────────────────────────

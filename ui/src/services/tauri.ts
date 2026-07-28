@@ -41,6 +41,7 @@ export async function invokeCommand<T>(
     'get_artist_detail',
     'get_album_detail',
     'get_queue',
+    'get_stale_favorite_artist_ids',
   ]);
   if (arrayCommands.has(cmd)) return [] as unknown as T;
   return undefined as T;

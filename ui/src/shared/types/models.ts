@@ -57,20 +57,14 @@ export interface Playlist {
 }
 
 /**
- * Frequency data payload decoded from binary FFT frames.
- *
- * Binary frame layout (all little-endian):
- * - Bytes 0-3: sample_rate (u32 LE)
- * - Bytes 4-7: peak (f32 LE)
- * - Bytes 8+: bins (N * f32 LE, N = fft_size/2)
- *
- * The `bins` field is a Float32Array view over the raw buffer,
- * avoiding conversion to number[] for performance at 60fps.
+ * Frequency data decoded from the JSON payload of the Tauri `fft-frame` event.
+ * Rust serializes `sample_rate` as `sampleRate`; the event adapter validates the
+ * payload and converts its numeric bin array to Float32Array.
  */
 export interface FrequencyData {
-  bins: Float32Array;   // f32 array from FFT binary frame, length = fft_size/2
-  sampleRate: number;   // u32, decoded from binary frame header
-  peak: number;         // f32, max bin value for amplitude reference
+  bins: Float32Array;
+  sampleRate: number;
+  peak: number;
 }
 
 /**

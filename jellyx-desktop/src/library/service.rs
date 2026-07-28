@@ -40,6 +40,14 @@ impl LibraryService {
         Self { db }
     }
 
+    /// Borrow the underlying `Database` for cache operations that live at the
+    /// persistence boundary (artist-detail SWR cache). Read-only access from
+    /// IPC commands; the `Arc` is not cloned so ownership stays with the
+    /// service.
+    pub fn db_handle(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
     /// Record a play event in history.
     #[allow(dead_code)]
     pub fn record_play(&self, track: &Track) -> Result<(), AppError> {

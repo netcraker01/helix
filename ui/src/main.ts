@@ -6,7 +6,7 @@
  */
 
 import { initI18n } from './i18n';
-import { initPlayerEvents } from '@features/player/stores/player';
+import { initLocalFft, initPlayerEvents, initProxyFft } from '@features/player/stores/player';
 import {
   initUpdaterEvents,
   startPeriodicCheck,
@@ -17,6 +17,7 @@ import { checkWelcome } from '@features/welcome/welcomeStore';
 import { mount } from 'svelte';
 import App from './app/App.svelte';
 import { getMigratedItem } from '@shared/utils/storage';
+import { initFocusRuntime } from '@features/focus/runtime';
 
 // Global styles
 import './styles/global.css';
@@ -35,6 +36,26 @@ function restoreDecorations(): void {
 async function bootstrap() {
   try {
     await initI18n();
+
+    // Local FFT is a playback bootstrap concern. Register its fire-and-forget
+    // event listener before other runtimes or any component can initialize.
+    try {
+      await initLocalFft();
+    } catch (err) {
+      // Keep the UI available; initPlayerEvents below retries the listener.
+      console.error('[Jellyx] Local FFT init failed:', err);
+    }
+
+    // Proxy FFT for remote streams: listens for Rust-computed FFT frames
+    // from the start_remote_fft pipeline.
+    try {
+      await initProxyFft();
+    } catch (err) {
+      console.error('[Jellyx] Proxy FFT init failed:', err);
+    }
+
+    await initFocusRuntime();
+
     mount(App, {
       target: document.getElementById('app')!,
     });

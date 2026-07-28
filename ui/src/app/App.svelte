@@ -1,9 +1,14 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Sidebar from './layout/Sidebar.svelte';
   import { sidebarCollapsed } from './layout/sidebar';
+  import { queueVisible } from '@features/player/stores/queuePanel';
+  import { createResponsiveCollapseOwner } from './layout/viewport';
   import BottomBar from './layout/BottomBar.svelte';
   import ToastContainer from '@shared/components/ToastContainer.svelte';
   import { currentPath } from './router/navigation';
+  import { getStaleFavoriteArtistIds } from '@services/commands';
+  import { warmArtistDetail } from '@features/library/stores/artistDetail';
 import Home from '../routes/Home/Page.svelte';
 import Search from '../routes/Search/Page.svelte';
 import PlaylistsPage from '../routes/Playlists/Page.svelte';
@@ -14,6 +19,7 @@ import FolderDetail from '../routes/Library/FolderDetail.svelte';
 import Settings from '../routes/Settings/Page.svelte';
 import ArtistPage from '../routes/Artist/Page.svelte';
 import AlbumPage from '../routes/Album/Page.svelte';
+import FocusPage from '../routes/Focus/Page.svelte';
 import MiniPlayer from '@features/mini-player/MiniPlayer.svelte';
 import Visualizer from '@features/player/components/Visualizer.svelte';
 import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from '@features/player/stores/player';
@@ -22,25 +28,25 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
   import GlobalSearchBar from './layout/GlobalSearchBar.svelte';
 
   // Cinematic ambient background is active when the Settings cinematic-mode
-  // toggle is ON and there is frequency data available. This is INDEPENDENT
-  // from the bottom-bar visualizer button (modoCineActive), which drives the
-  // Winamp-style fullscreen overlay in Visualizer.svelte.
+  // toggle is ON and there is frequency data available.
   $: cineOn = $cinematicMode && $frequencyData != null;
 
-  // Derive a cheap bass/low-end pulse by averaging the first ~25% of bins,
-  // and pass the peak to the CSS via custom properties so Svelte reactivity
-  // updates the gradients at ~60fps without a JS animation loop.
-  $: cinePulse = (() => {
+  // Bass and peak for the cinematic CSS gradients. These are PRIMITIVE reactive
+  // values (number, not object), so Svelte compares by value and only re-renders
+  // when the number actually changes — NOT every time frequencyData updates.
+  // Previously this was a single `$: cinePulse = { bass, peak }` which created
+  // a NEW object reference every frame (~70fps), forcing App.svelte to
+  // re-render entirely even when the values hadn't changed.
+  $: cineBass = (() => {
     const fd = $frequencyData;
-    if (fd == null) return { bass: 0, peak: 0 };
+    if (!fd || !fd.bins.length) return 0;
     const bins = fd.bins;
-    if (!bins || bins.length === 0) return { bass: 0, peak: fd.peak ?? 0 };
     const n = Math.max(1, Math.floor(bins.length * 0.25));
     let sum = 0;
     for (let i = 0; i < n; i++) sum += bins[i];
-    const bass = Math.min(1, sum / n);
-    return { bass, peak: fd.peak ?? 0 };
+    return Math.min(1, sum / n);
   })();
+  $: cinePeak = $frequencyData?.peak ?? 0;
 
   type RouteMatch =
     | { name: 'home' }
@@ -53,7 +59,8 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
     | { name: 'settings' }
     | { name: 'mini-player' }
     | { name: 'artist'; id: string }
-    | { name: 'album'; id: string };
+    | { name: 'album'; id: string }
+    | { name: 'focus' };
 
   function resolveRoute(path: string): RouteMatch {
     if (path === '/search') return { name: 'search' };
@@ -66,10 +73,45 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
     if (path.startsWith('/playlists/')) return { name: 'playlist-detail', id: decodeURIComponent(path.slice('/playlists/'.length)) };
     if (path.startsWith('/artist/')) return { name: 'artist', id: decodeURIComponent(path.slice('/artist/'.length)) };
     if (path.startsWith('/album/')) return { name: 'album', id: decodeURIComponent(path.slice('/album/'.length)) };
+    if (path === '/focus') return { name: 'focus' };
     return { name: 'home' };
   }
 
   $: route = resolveRoute($currentPath);
+
+  onMount(() => {
+    const updateResponsivePanels = createResponsiveCollapseOwner(() => {
+      sidebarCollapsed.set(true);
+      queueVisible.set(false);
+    });
+    const onResize = () => updateResponsivePanels(window.innerWidth);
+    onResize();
+    window.addEventListener('resize', onResize);
+
+    // ── Artist detail SWR startup warmer ─────────────────────────────
+    // After a 4-second startup delay, fetch stale favorite artists and
+    // warm their detail caches in the background so the next visit to an
+    // artist page shows fresh data without foreground latency.
+    const warmerTimer = setTimeout(async () => {
+      try {
+        const staleIds = await getStaleFavoriteArtistIds();
+        // Warm each stale artist in the background. The bounded scheduler
+        // limits concurrency so this does not compete with user-triggered
+        // foreground loads.
+        for (const id of staleIds) {
+          warmArtistDetail(id);
+        }
+      } catch {
+        // Startup warmer failures are non-critical — the foreground load
+        // path will fetch fresh data on demand.
+      }
+    }, 4_000);
+
+    return () => {
+      window.removeEventListener('resize', onResize);
+      clearTimeout(warmerTimer);
+    };
+  });
 </script>
 
 {#if route.name === 'mini-player'}
@@ -84,7 +126,7 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
   {#if cineOn}
     <div
       class="cinematic-layer"
-      style="--cine-peak: {cinePulse.peak}; --cine-bass: {cinePulse.bass}; --cine-intensity: {$cinematicIntensity};"
+      style="--cine-peak: {cinePeak}; --cine-bass: {cineBass}; --cine-intensity: {$cinematicIntensity};"
       aria-hidden="true"
     >
       <div class="cinematic-wash"></div>
@@ -116,6 +158,8 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
       <ArtistPage id={route.id} />
     {:else if route.name === 'album'}
       <AlbumPage id={route.id} />
+    {:else if route.name === 'focus'}
+      <FocusPage />
     {:else}
       <Home />
     {/if}

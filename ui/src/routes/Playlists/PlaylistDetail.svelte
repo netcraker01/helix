@@ -3,11 +3,12 @@
   import { get } from 'svelte/store';
   import { navigate } from '@app/router/navigation';
   import { t } from '@i18n';
-  import { Play, Trash2, Edit3, ArrowLeft, Music, Folder } from 'lucide-svelte';
+  import { Play, Trash2, Edit3, ArrowLeft, Music, Folder, Plus, PlayCircle, Youtube, Loader2 } from 'lucide-svelte';
   import { playlists } from '@features/playlists/stores/playlists';
-  import { playTrack, addToQueueAction } from '@shared/utils/actions';
-  import { getPlaylistTracks, removeTrackFromPlaylist, getPlaylistThumbnails, getChildPlaylists, countPlaylistTracks } from '@services/commands';
+  import { playTrack, addToQueueAction, playNextAction } from '@shared/utils/actions';
+  import { getPlaylistTracks, removeTrackFromPlaylist, getPlaylistThumbnails, getChildPlaylists, countPlaylistTracks, resolveTrack, addTrackToPlaylist } from '@services/commands';
   import { albumArtUrl } from '@shared/utils/assetUrl';
+  import { notifications } from '@shared/stores/notifications';
   import JellyxLogo from '@shared/components/JellyxLogo.svelte';
   import type { Track, PlaylistTrackEntry, UserPlaylist } from '@shared/types/models';
 
@@ -153,9 +154,96 @@
   }
 
   $: uniqueThumbnails = Array.from(new Set(thumbnails));
+
+  // ── YouTube import: paste URL or drag & drop ─────────────────────
+  let showImportInput = false;
+  let importUrl = '';
+  let importing = false;
+  let dragOver = false;
+
+  /** Extract a YouTube video ID from common URL formats.
+   *  Supports: youtube.com/watch?v=ID, youtu.be/ID, youtube.com/embed/ID,
+   *  youtube.com/shorts/ID. Returns null if not a YouTube URL. */
+  function extractYouTubeVideoId(url: string): string | null {
+    const trimmed = url.trim();
+    if (!trimmed) return null;
+    try {
+      const u = new URL(trimmed);
+      const host = u.hostname.replace(/^www\./, '');
+      if (host === 'youtu.be') {
+        const id = u.pathname.slice(1);
+        return id || null;
+      }
+      if (host === 'youtube.com' || host === 'm.youtube.com') {
+        const vParam = u.searchParams.get('v');
+        if (vParam) return vParam;
+        const parts = u.pathname.split('/');
+        const embedIdx = parts.indexOf('embed');
+        if (embedIdx >= 0 && parts[embedIdx + 1]) return parts[embedIdx + 1];
+        const shortsIdx = parts.indexOf('shorts');
+        if (shortsIdx >= 0 && parts[shortsIdx + 1]) return parts[shortsIdx + 1];
+      }
+    } catch {
+      // Not a valid URL — maybe it's a bare video ID
+      if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+    }
+    return null;
+  }
+
+  async function importYouTubeTrack(url: string): Promise<void> {
+    const videoId = extractYouTubeVideoId(url);
+    if (!videoId) {
+      notifications.push({ type: 'error', title: 'Import failed', message: 'Invalid YouTube URL', dismissible: true });
+      return;
+    }
+    importing = true;
+    try {
+      const track = await resolveTrack('YouTube', videoId);
+      await addTrackToPlaylist(id, track);
+      await loadTracks();
+      notifications.push({ type: 'success', title: 'Added to playlist', message: track.title, dismissible: true });
+    } catch (e) {
+      notifications.push({ type: 'error', title: 'Import failed', message: String(e), dismissible: true });
+    } finally {
+      importing = false;
+    }
+  }
+
+  async function handleImportSubmit(): Promise<void> {
+    if (!importUrl.trim() || importing) return;
+    await importYouTubeTrack(importUrl);
+    importUrl = '';
+    showImportInput = false;
+  }
+
+  function handleDragOver(e: DragEvent): void {
+    e.preventDefault();
+    dragOver = true;
+  }
+
+  function handleDragLeave(): void {
+    dragOver = false;
+  }
+
+  async function handleDrop(e: DragEvent): Promise<void> {
+    e.preventDefault();
+    dragOver = false;
+    // Try text data from the drop — works for URLs dragged from the browser
+    const text = e.dataTransfer?.getData('text') || e.dataTransfer?.getData('text/uri-list') || '';
+    if (text) {
+      await importYouTubeTrack(text);
+    }
+  }
 </script>
 
-<div class="page-playlist-detail">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="page-playlist-detail"
+  class:drag-active={dragOver}
+  on:dragover={handleDragOver}
+  on:dragleave={handleDragLeave}
+  on:drop={handleDrop}
+>
   <button class="back-btn" on:click={() => navigate('/playlists')} type="button">
     <ArrowLeft size={18} />
     <span>Back</span>
@@ -214,10 +302,37 @@
           <Play size={16} />
           <span>Play all</span>
         </button>
+        <button class="icon-btn yt-import-btn" on:click={() => (showImportInput = !showImportInput)} title="Import from YouTube" type="button">
+          {#if importing}
+            <Loader2 size={16} class="spin" />
+          {:else}
+            <Youtube size={16} />
+          {/if}
+          <span>Import</span>
+        </button>
         <button class="icon-btn delete-btn" on:click={() => (showDeleteDialog = true)} title="Delete list" type="button">
           <Trash2 size={16} />
         </button>
       </div>
+      {#if showImportInput}
+        <div class="import-row">
+          <input
+            class="import-input"
+            type="text"
+            placeholder="Paste YouTube URL (e.g. https://youtube.com/watch?v=...)"
+            bind:value={importUrl}
+            on:keydown={(e) => e.key === 'Enter' && handleImportSubmit()}
+            disabled={importing}
+          />
+          <button class="icon-btn import-submit" on:click={handleImportSubmit} disabled={importing || !importUrl.trim()} type="button">
+            {#if importing}
+              <Loader2 size={16} class="spin" />
+            {:else}
+              <Plus size={16} />
+            {/if}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -272,6 +387,12 @@
             <span class="track-artist">{entry.track.artist}</span>
           </div>
           <span class="track-duration">{formatDuration(entry.track.duration)}</span>
+          <button class="queue-btn" on:click={() => playNextAction(entry.track)} title="Play next" type="button">
+            <PlayCircle size={14} />
+          </button>
+          <button class="queue-btn" on:click={() => addToQueueAction(entry.track)} title="Add to queue" type="button">
+            <Plus size={14} />
+          </button>
           <button class="remove-btn" on:click={() => handleRemoveTrack(entry.position)} title="Remove" type="button">
             <Trash2 size={14} />
           </button>
@@ -628,6 +749,27 @@
     color: #ef4444;
   }
 
+  .queue-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #9ca3af);
+    cursor: pointer;
+    padding: 0.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s, color 0.2s;
+  }
+
+  .track-row:hover .queue-btn {
+    opacity: 1;
+  }
+
+  .queue-btn:hover {
+    color: var(--color-accent, #6366f1);
+  }
+
   .delete-btn {
     color: #ef4444;
   }
@@ -635,6 +777,67 @@
   .delete-btn:hover {
     background: rgba(239, 68, 68, 0.15);
     color: #f87171;
+  }
+
+  .yt-import-btn {
+    color: #ff0000;
+  }
+
+  .yt-import-btn:hover {
+    background: rgba(255, 0, 0, 0.1);
+    color: #ff3333;
+  }
+
+  .import-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.5rem;
+  }
+
+  .import-input {
+    flex: 1;
+    max-width: 400px;
+    padding: 0.4rem 0.75rem;
+    background: var(--bg-elevated, #1f2937);
+    border: 1px solid var(--border-color, #1f2937);
+    border-radius: 8px;
+    color: var(--text-primary, #e0e0e0);
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+
+  .import-input:focus {
+    border-color: var(--color-accent, #6366f1);
+    outline: none;
+  }
+
+  .import-submit {
+    background: var(--color-accent, #6366f1);
+    color: white;
+  }
+
+  .import-submit:hover {
+    background: var(--color-accent-hover, #4f52d9);
+  }
+
+  .import-submit:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  :global(.spin) {
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .page-playlist-detail.drag-active {
+    outline: 2px dashed var(--color-accent, #6366f1);
+    outline-offset: -4px;
+    background: rgba(99, 102, 241, 0.05);
   }
 
   .dialog-overlay {

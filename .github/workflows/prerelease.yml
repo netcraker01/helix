@@ -1,0 +1,239 @@
+# =============================================================================
+# Jellyx Player — Pre-Release Pipeline (Linux, Windows, macOS)
+# =============================================================================
+# Builds all three platforms on a v* tag push and creates a GitHub pre-release
+# (NOT marked as Latest). Use this to privately test builds on Windows and Mac
+# before promoting to a full release.
+#
+# Trigger: push of a version tag matching v* (e.g. v0.4.3)
+#
+# Unlike release.yml, this workflow:
+#   - Does NOT require the commit to be on main
+#   - Does NOT require the "Validate candidate" check to pass
+#   - Creates a pre-release (--prerelease) instead of a full release
+#   - Does NOT rename artifacts (uses Tauri's default names)
+#
+# To promote a pre-release to a full release after testing:
+#   gh release edit v0.4.3 --remove-prerelease
+#
+# To trigger:
+#   git tag v0.4.3
+#   git push origin v0.4.3
+# =============================================================================
+
+name: Pre-Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            patchelf \
+            rpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - run: npm ci
+      - run: npm ci
+        working-directory: ui
+
+      - run: cargo install tauri-cli --locked
+
+      - name: Build AppImage
+        env:
+          NO_STRIP: "1"
+        run: cargo tauri build --bundles appimage
+
+      - name: Build deb
+        run: cargo tauri build --bundles deb
+
+      - name: Build rpm
+        run: cargo tauri build --bundles rpm
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - run: npm ci
+      - run: npm ci
+        working-directory: ui
+
+      - run: cargo install tauri-cli --locked --force
+
+      - name: Build MSI + NSIS
+        run: cargo tauri build
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - run: npm ci
+      - run: npm ci
+        working-directory: ui
+
+      - run: cargo install tauri-cli --locked
+
+      - name: Build DMG
+        run: cargo tauri build --bundles dmg
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  publish-prerelease:
+    name: Publish Pre-Release
+    runs-on: ubuntu-22.04
+    needs: [build-linux, build-windows, build-macos]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(grep '^version' jellyx-desktop/Cargo.toml | head -1 | cut -d'"' -f2)"
+          tag="v${version}"
+          
+          # Delete existing release if it's a draft
+          if gh release view "$tag" --json isDraft --jq '.isDraft' >/dev/null 2>&1; then
+            gh release delete "$tag" --yes || true
+          fi
+          
+          # Collect all artifact files
+          mapfile -t assets < <(find release-assets -type f \( \
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \
+          \) | sort)
+          
+          # Generate release notes from commits since last tag
+          prev_tag="$(git tag --sort=-version:refname | grep -E '^v[0-9]' | grep -v "$tag" | head -1 || true)"
+          if [ -n "$prev_tag" ]; then
+            notes=$(git log "${prev_tag}..HEAD" --pretty=format:"- %s" --no-merges | head -50)
+          else
+            notes="Initial pre-release"
+          fi
+          
+          # Create pre-release (not Latest, marked as pre-release)
+          gh release create "$tag" \
+            --title "Jellyx ${version} (Pre-Release)" \
+            --notes "$notes" \
+            --prerelease \
+            "${assets[@]}"
+          
+          echo "Pre-release $tag created with ${#assets[@]} assets"

@@ -70,20 +70,39 @@ export function onUpdateAvailable(cb: (info: UpdateInfo) => void): Promise<Unlis
 /**
  * Tauri event payload for FFT frames emitted by the Rust engine.
  *
- * The Rust side serializes `FrequencyData` as JSON via `webview.emit()`.
+ * The Rust side serializes `FrequencyData` as JSON via `AppHandle::emit()`.
  * `bins` arrives as a plain `number[]` which we convert to `Float32Array`.
  */
-interface FftFramePayload {
+export interface FftFramePayload {
   bins: number[];
   sampleRate: number;
   peak: number;
 }
 
-export function frequencyDataFromFftPayload(payload: FftFramePayload): FrequencyData {
+export function frequencyDataFromFftPayload(payload: unknown): FrequencyData {
+  if (!payload || typeof payload !== 'object') {
+    throw new TypeError('Invalid fft-frame payload: expected an object');
+  }
+
+  const frame = payload as Partial<FftFramePayload> & { sample_rate?: unknown };
+  if (!Array.isArray(frame.bins)) {
+    throw new TypeError('Invalid fft-frame payload: bins must be an array');
+  }
+  if (typeof frame.sampleRate !== 'number' || !Number.isFinite(frame.sampleRate) || frame.sampleRate <= 0) {
+    const legacy = 'sample_rate' in frame ? ' (legacy sample_rate is not supported)' : '';
+    throw new TypeError(`Invalid fft-frame payload: sampleRate must be a positive number${legacy}`);
+  }
+  if (typeof frame.peak !== 'number' || !Number.isFinite(frame.peak) || frame.peak < 0) {
+    throw new TypeError('Invalid fft-frame payload: peak must be a finite non-negative number');
+  }
+  if (frame.bins.some((bin) => typeof bin !== 'number' || !Number.isFinite(bin) || bin < 0)) {
+    throw new TypeError('Invalid fft-frame payload: bins must contain finite non-negative numbers');
+  }
+
   return {
-    bins: new Float32Array(payload.bins),
-    sampleRate: payload.sampleRate,
-    peak: payload.peak,
+    bins: new Float32Array(frame.bins),
+    sampleRate: frame.sampleRate,
+    peak: frame.peak,
   };
 }
 
@@ -99,6 +118,20 @@ export function frequencyDataFromFftPayload(payload: FftFramePayload): Frequency
  */
 export async function onFftFrame(cb: (data: FrequencyData) => void): Promise<UnlistenFn> {
   return subscribeEvent<FftFramePayload>('fft-frame', (payload) => {
+    cb(frequencyDataFromFftPayload(payload));
+  });
+}
+
+/**
+ * Subscribe to proxy FFT frames from the Rust engine for remote streams.
+ *
+ * The Rust side emits `"proxy-fft-frame"` events when the user starts a remote
+ * stream and the Rust pipeline finishes downloading, decoding, and computing FFT
+ * data. Same wire format as `"fft-frame"` but on a separate event to distinguish
+ * Rust-native local FFT from Rust-proxied remote FFT.
+ */
+export async function onProxyFftFrame(cb: (data: FrequencyData) => void): Promise<UnlistenFn> {
+  return subscribeEvent<FftFramePayload>('proxy-fft-frame', (payload) => {
     cb(frequencyDataFromFftPayload(payload));
   });
 }

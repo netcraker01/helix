@@ -3,17 +3,18 @@
  *
  * Draws a set of rings that grow outward from the canvas center, driven by
  * overall spectrum energy and a read-only time term (`performance.now()`).
- * No spawn queue, no particle list, no per-frame state machine: each ring's
- * radius is a pure function of `(energy, time, ringIndex)`, so the "tunnel"
- * illusion is produced by math alone and is fully deterministic. Safe for
+ * No spawn queue or particle list: each ring's radius is a function of
+ * `(energy, time, ringIndex)`, so the "tunnel" illusion stays bounded. Safe for
  * the WebKitGTK (JSC JIT disabled) dev runtime.
  *
- * Deliberately avoids the patterns previously implicated in the WebKitGTK
- * crash: no `shadowBlur`, no `globalCompositeOperation: 'lighter'`, no
- * WeakMap state, no per-frame allocations beyond the stroke paths.
+ * Uses ordinary stroke/fill passes and renderer-local interpolation only.
  */
 import type { FrequencyData } from '@shared/types/models';
 import type { VisualizerTheme } from './types';
+import type { SpectrumAnalysis } from './analyzeSpectrum';
+import { createFrameInterpolator } from './frameInterpolation';
+
+const interpolateFrame = createFrameInterpolator(0.32);
 
 /** Number of concurrent rings in the tunnel. Bounded for cheap frames. */
 const RING_COUNT = 8;
@@ -36,19 +37,22 @@ export function renderTunnel(
   width: number,
   height: number,
   data: FrequencyData | null,
-  theme: VisualizerTheme
+  theme: VisualizerTheme,
+  analysis?: SpectrumAnalysis
 ): void {
   // Overall energy: average of the low and mid bands for a "musical" drive.
   let energy = 0;
-  if (data && data.bins.length) {
-    const { bins, peak } = data;
+  const frame = interpolateFrame(data, theme.reactivity);
+  if (frame && frame.bins.length) {
+    const { bins, peak } = frame;
     const n = bins.length;
     const lowEnd = Math.max(1, Math.floor(n / 3));
     const midEnd = Math.max(lowEnd + 1, Math.floor((2 * n) / 3));
     let sum = 0;
     for (let i = 0; i < midEnd; i++) sum += bins[i];
     const avg = sum / midEnd;
-    energy = peak > 0 ? Math.pow(avg / peak, 0.85) : 0;
+    const normalized = peak > 0 ? Math.min(1, avg / peak) : 0;
+    energy = Math.pow(normalized, 0.85);
   }
 
   const cx = width / 2;
@@ -58,34 +62,51 @@ export function renderTunnel(
   if (maxRadius <= 0) return;
 
   const now = performance.now();
-  const phase = (now % RING_CYCLE_MS) / RING_CYCLE_MS; // 0..1
+  const speed = 1 + (analysis?.treble ?? 0) * 0.18 + (analysis?.beat ? 0.16 : 0);
+  const phase = ((now * speed) % RING_CYCLE_MS) / RING_CYCLE_MS; // 0..1
 
   ctx.save();
-  ctx.strokeStyle = theme.accentColor;
-  ctx.lineWidth = Math.max(1, BASE_STROKE + energy * 4);
+  ctx.strokeStyle = theme.palette[0] ?? theme.accentColor;
+  ctx.lineWidth = Math.max(1, BASE_STROKE + energy * 4 + (analysis?.beat ? 2 : 0));
 
+  // Shadow pass (alpha capped at 0.14) — wider ring strokes for a soft glow.
+  ctx.globalAlpha = 0.14;
   for (let i = 0; i < RING_COUNT; i++) {
-    // Each ring is offset within the cycle so they form a continuous tunnel.
     const ringPhase = (phase + i / RING_COUNT) % 1;
-    // Radius grows non-linearly for a perspective-like deepening.
     const radius = ringPhase * ringPhase * maxRadius;
     if (radius < 1) continue;
+    const visibility = (1 - ringPhase) * (0.3 + energy * 0.6);
+    if (visibility <= 0) continue;
+    ctx.globalAlpha = Math.min(0.14, visibility * 0.35);
+    ctx.lineWidth += 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + 2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.lineWidth -= 3;
+  }
 
-    // Alpha fades as the ring approaches the edge; newest ring is brightest.
-    const alpha = (1 - ringPhase) * (0.25 + energy * 0.6);
-    if (alpha <= 0) continue;
-
-    ctx.globalAlpha = alpha;
+  // Main pass (alpha 0.75) — crisp rings.
+  ctx.globalAlpha = 0.75;
+  for (let i = 0; i < RING_COUNT; i++) {
+    const ringPhase = (phase + i / RING_COUNT) % 1;
+    const radius = ringPhase * ringPhase * maxRadius;
+    if (radius < 1) continue;
+    const visibility = (1 - ringPhase) * (0.3 + energy * 0.6);
+    if (visibility <= 0) continue;
     ctx.beginPath();
     ctx.arc(cx, cy, radius, 0, Math.PI * 2);
     ctx.stroke();
   }
 
-  // Center pulse: a filled disc whose radius tracks energy, anchoring the
-  // tunnel origin. Kept small and alpha-capped to avoid a hotspot.
-  const coreRadius = Math.max(theme.barMinHeight, energy * Math.min(width, height) * 0.08);
-  ctx.globalAlpha = 0.35 + energy * 0.4;
-  ctx.fillStyle = theme.accentColor;
+  // Center pulse: a filled disc whose radius tracks energy.
+  const coreRadius = Math.max(theme.barMinHeight, energy * Math.min(width, height) * 0.08 * (analysis?.beat ? 1.22 : 1));
+  ctx.globalAlpha = 0.14;
+  ctx.fillStyle = theme.palette[0] ?? theme.accentColor;
+  ctx.beginPath();
+  ctx.arc(cx, cy, coreRadius + 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 0.75;
+  ctx.fillStyle = theme.palette[0] ?? theme.accentColor;
   ctx.beginPath();
   ctx.arc(cx, cy, coreRadius, 0, Math.PI * 2);
   ctx.fill();

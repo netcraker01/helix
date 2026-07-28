@@ -37,8 +37,10 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  # Temporarily disabled — use prerelease.yml for v0.4.3 testing.
+  # Re-enable by removing the 'if: false' guard below.
+  # push:
+  #   tags: ["v*"]
   workflow_dispatch:
     # Manual releases are always pinned to the current protected main head.
     # Arbitrary commits and tag names are intentionally not accepted.

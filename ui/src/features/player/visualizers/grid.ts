@@ -7,13 +7,15 @@
  * row's amplitude threshold, producing a heatmap-style "equalizer grid"
  * that is visually distinct from the linear bar / radial / aurora modes.
  *
- * Pure Canvas2D, single pass, no allocations per frame beyond the cell
- * coordinates. No `shadowBlur`, no `globalCompositeOperation`, no particle
- * system, no per-frame state machine. Safe for the WebKitGTK (JSC JIT
- * disabled) dev runtime.
+ * Pure Canvas2D layered cell passes with bounded interpolation state. Safe for
+ * the WebKitGTK (JSC JIT disabled) dev runtime.
  */
 import type { FrequencyData } from '@shared/types/models';
 import type { VisualizerTheme } from './types';
+import type { SpectrumAnalysis } from './analyzeSpectrum';
+import { createFrameInterpolator } from './frameInterpolation';
+
+const interpolateFrame = createFrameInterpolator(0.35);
 
 /** Fixed grid geometry. Kept small so cell count stays bounded on any canvas. */
 const GRID_COLUMNS = 24;
@@ -33,11 +35,13 @@ export function renderGrid(
   width: number,
   height: number,
   data: FrequencyData | null,
-  theme: VisualizerTheme
+  theme: VisualizerTheme,
+  analysis?: SpectrumAnalysis
 ): void {
   if (!data || !data.bins.length) return;
 
-  const { bins, peak } = data;
+  const frame = interpolateFrame(data, theme.reactivity)!;
+  const { bins, peak } = frame;
   const columns = Math.min(GRID_COLUMNS, bins.length);
   const groupSize = Math.ceil(bins.length / columns);
 
@@ -46,47 +50,82 @@ export function renderGrid(
   const cellH = Math.max(1, (height - gap * (GRID_ROWS + 1)) / GRID_ROWS);
 
   ctx.save();
-  ctx.fillStyle = theme.accentColor;
+  ctx.fillStyle = theme.palette[0] ?? theme.accentColor;
 
+  // Three-pass rendering to batch canvas state changes. Lit cells have a
+  // shadow (alpha 0.14) and main fill (alpha 0.75); dim cells are alpha 0.06.
+  // Batching per alpha reduces state changes from 3×cellCount to just 3.
+
+  // Pre-compute column metadata: lit rows from bottom.
+  const colLitRows = new Uint8Array(columns);
   for (let col = 0; col < columns; col++) {
-    // Average magnitude for this column's bin group.
-    let sum = 0;
-    let count = 0;
-    const groupStart = col * groupSize;
-    const groupEnd = Math.min((col + 1) * groupSize, bins.length);
-    for (let j = groupStart; j < groupEnd; j++) {
-      sum += bins[j];
-      count++;
-    }
-    const magnitude = count > 0 ? sum / count : 0;
-    const normalized = peak > 0 ? magnitude / peak : 0;
-    const shaped = Math.pow(normalized, 0.85);
+    colLitRows[col] = litRowsAt(col, bins, peak, analysis, groupSize);
+  }
 
-    // Number of lit rows from the bottom, based on shaped energy.
-    const litRows = Math.min(GRID_ROWS, Math.floor(shaped * GRID_ROWS + 0.5));
+  // Pass 1: lit cell shadows (alpha 0.14).
+  ctx.globalAlpha = 0.14;
+  for (let col = 0; col < columns; col++) {
+    const litRowsCount = colLitRows[col];
+    if (litRowsCount === 0) continue;
     const x = gap + col * (cellW + gap);
-
     for (let row = 0; row < GRID_ROWS; row++) {
-      // Row 0 is the top; convert to "rows from the bottom".
-      const fromBottom = GRID_ROWS - 1 - row;
-      const lit = fromBottom < litRows;
-      // Distance of this row from the lit front, used for falloff alpha.
-      const distance = fromBottom - (litRows - 1);
-      const y = gap + row * (cellH + gap);
+      if (GRID_ROWS - 1 - row < litRowsCount) {
+        const y = gap + row * (cellH + gap);
+        ctx.fillRect(x - 1, y - 1, cellW + 2, cellH + 2);
+      }
+    }
+  }
 
-      if (lit) {
-        // Brightest at the lit front (distance 0), fading upward.
-        const alpha = distance === 0 ? 0.95 : Math.max(0.15, 0.95 - distance * 0.25);
-        ctx.globalAlpha = alpha;
-        ctx.fillRect(x, y, cellW, cellH);
-      } else {
-        // Dim base grid so the matrix is always visible (idle state too).
-        ctx.globalAlpha = 0.06;
+  // Pass 2: lit cell mains (alpha 0.75).
+  ctx.globalAlpha = 0.75;
+  for (let col = 0; col < columns; col++) {
+    const litRowsCount = colLitRows[col];
+    if (litRowsCount === 0) continue;
+    const x = gap + col * (cellW + gap);
+    for (let row = 0; row < GRID_ROWS; row++) {
+      if (GRID_ROWS - 1 - row < litRowsCount) {
+        const y = gap + row * (cellH + gap);
         ctx.fillRect(x, y, cellW, cellH);
       }
     }
   }
 
+  // Pass 3: dim cells (alpha 0.06).
+  ctx.globalAlpha = 0.06;
+  for (let col = 0; col < columns; col++) {
+    const litRowsCount = colLitRows[col];
+    if (litRowsCount >= GRID_ROWS) continue;
+    const x = gap + col * (cellW + gap);
+    for (let row = 0; row < GRID_ROWS - litRowsCount; row++) {
+      // Top rows (not lit) — iterate from top to skip lit rows.
+      const r = row; // row 0 = top, already "from top"
+      const y = gap + r * (cellH + gap);
+      ctx.fillRect(x, y, cellW, cellH);
+    }
+  }
+
   ctx.globalAlpha = 1;
   ctx.restore();
+}
+
+function litRowsAt(
+  col: number,
+  bins: Float32Array,
+  peak: number,
+  analysis: SpectrumAnalysis | undefined,
+  groupSize: number,
+): number {
+  const groupStart = col * groupSize;
+  const groupEnd = Math.min((col + 1) * groupSize, bins.length);
+  let sum = 0;
+  let count = 0;
+  for (let j = groupStart; j < groupEnd; j++) {
+    sum += bins[j];
+    count++;
+  }
+  const magnitude = count > 0 ? sum / count : 0;
+  const normalized = peak > 0 ? Math.min(1, magnitude / peak) : 0;
+  const shaped = Math.pow(normalized, 0.85);
+  const punch = 1 + (analysis?.mid ?? 0) * 0.08 + (analysis?.beat ? 0.16 : 0);
+  return Math.min(GRID_ROWS, Math.floor(shaped * punch * GRID_ROWS + 0.5));
 }

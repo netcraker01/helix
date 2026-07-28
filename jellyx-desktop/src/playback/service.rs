@@ -70,6 +70,8 @@ pub struct PlaybackService<R: tauri::Runtime = tauri::Wry> {
     /// `stream-resolved` event. The frontend uses its own counter for
     /// user-initiated plays; this counter covers backend-initiated plays.
     stream_request_counter: AtomicU64,
+    /// Invalidates decoder-adjacent workers when playback is replaced.
+    playback_generation: Arc<AtomicU64>,
 }
 
 /// Internal state protected by the Mutex.
@@ -139,6 +141,10 @@ fn stream_url_for_proxy(
         })
 }
 
+fn fft_worker_is_current(generation: &AtomicU64, worker_generation: u64) -> bool {
+    generation.load(Ordering::Acquire) == worker_generation
+}
+
 impl<R: tauri::Runtime> PlaybackService<R> {
     /// Create a new PlaybackService.
     ///
@@ -183,6 +189,7 @@ impl<R: tauri::Runtime> PlaybackService<R> {
             // Start at 1 so the first backend-initiated request is non-zero.
             // The frontend's isLatestStreamRequest guard rejects id === 0.
             stream_request_counter: AtomicU64::new(1),
+            playback_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -275,6 +282,7 @@ impl<R: tauri::Runtime> PlaybackService<R> {
 
         // Stop any currently playing audio first
         self.stop()?;
+        let playback_generation = self.playback_generation.load(Ordering::Acquire);
 
         if !Self::local_file_is_accessible(path) {
             return self.handle_invalid_local_track(track);
@@ -341,6 +349,7 @@ impl<R: tauri::Runtime> PlaybackService<R> {
             db: self.db.clone(),
             proxy: self.proxy.clone(),
             stream_request_counter: AtomicU64::new(1),
+            playback_generation: self.playback_generation.clone(),
         };
 
         // Spawn decoder thread
@@ -563,9 +572,13 @@ impl<R: tauri::Runtime> PlaybackService<R> {
         let fft_app_handle = self.emitter.app_handle().clone();
         let fft_sample_rate = sample_rate;
         let fft_engine_state = self.state.clone();
+        let fft_worker_generation = self.playback_generation.clone();
         thread::spawn(move || {
             let mut fft_engine = FftEngine::new(1024, fft_subscriber, fft_sample_rate, channels);
             loop {
+                if !fft_worker_is_current(&fft_worker_generation, playback_generation) {
+                    break;
+                }
                 // Check if we should stop
                 {
                     let s = fft_engine_state.lock().unwrap();
@@ -576,6 +589,11 @@ impl<R: tauri::Runtime> PlaybackService<R> {
 
                 if !fft_engine.collect_next_frame(Duration::from_millis(100)) {
                     continue;
+                }
+                // Replacement may happen while the worker is blocked waiting for
+                // the old tap. Never emit that stale frame into the new playback.
+                if !fft_worker_is_current(&fft_worker_generation, playback_generation) {
+                    break;
                 }
                 if let Some(freq_data) = fft_engine.analyze_if_ready() {
                     if let Err(error) = emit_fft_frame(&fft_app_handle, &freq_data) {
@@ -815,6 +833,26 @@ impl<R: tauri::Runtime> PlaybackService<R> {
         Ok(())
     }
 
+    /// Re-resolve a remote stream URL after the browser reports an expired source.
+    pub fn re_resolve_stream(
+        &self,
+        track: Track,
+        _stream_request_id: u64,
+    ) -> Result<(String, Option<String>), AppError> {
+        self.sources
+            .invalidate_stream_cache(&track.source, &track.source_id);
+        let remote_url = self
+            .sources
+            .resolve_stream_url_with_refresh(&track.source, &track.source_id, true)
+            .map_err(AppError::from)?;
+        let stream_url = stream_url_for_proxy(self.proxy.as_ref(), &remote_url)?;
+        let capability = self
+            .proxy
+            .as_ref()
+            .map(|(_, capability)| capability.clone());
+        Ok((stream_url, capability))
+    }
+
     /// Download a remote stream URL to a local cache file and return its absolute path.
     ///
     /// This is the YouTube local-cache strategy: a fully-downloaded local m4a
@@ -968,6 +1006,7 @@ impl<R: tauri::Runtime> PlaybackService<R> {
     /// the decoder thread and closes PCM bus channels), clears the
     /// shared decoder/backend references, and emits state_changed.
     pub fn stop(&self) -> Result<(), AppError> {
+        self.playback_generation.fetch_add(1, Ordering::AcqRel);
         {
             let mut s = self.state.lock().map_err(|_| AppError {
                 code: "UNKNOWN_ERROR".into(),
@@ -1138,6 +1177,21 @@ impl<R: tauri::Runtime> PlaybackService<R> {
     ) -> Vec<Track> {
         self.sources
             .search_all_enabled(query, Some(enabled_sources), offset, limit)
+    }
+
+    /// Search tracks from enabled sources, returning merged tracks and the
+    /// list of source names that errored. Used by the authoritative
+    /// artist-detail refresh so partial failures can be distinguished from
+    /// a clean empty result and cached tracks from failed sources preserved.
+    pub fn search_all_tracks_enabled_with_failures(
+        &self,
+        query: &str,
+        enabled_sources: &std::collections::HashSet<String>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<Track>, Vec<String>) {
+        self.sources
+            .search_all_enabled_with_failures(query, Some(enabled_sources), offset, limit)
     }
 
     /// Search playlists from enabled sources only.
@@ -1829,6 +1883,17 @@ mod tests {
     use crate::playback::state::QueueState;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn replacement_invalidates_the_previous_fft_worker_generation() {
+        let generation = AtomicU64::new(11);
+        assert!(fft_worker_is_current(&generation, 11));
+
+        generation.fetch_add(1, Ordering::AcqRel);
+
+        assert!(!fft_worker_is_current(&generation, 11));
+        assert!(fft_worker_is_current(&generation, 12));
+    }
 
     #[test]
     fn remote_stream_requires_loopback_proxy_and_never_returns_direct_https_url() {

@@ -63,4 +63,24 @@ describe('MiniVisualizer', () => {
 
     expect(fftSpy).not.toHaveBeenCalled();
   });
+
+  it('falls back to plain Canvas2D when context options are rejected', () => {
+    const ctx = { clearRect: vi.fn(), fillRect: vi.fn(), fillStyle: '', globalAlpha: 1 };
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockImplementation((_type, options) => options ? null : ctx as unknown as CanvasRenderingContext2D);
+    let frame: FrameRequestCallback | undefined;
+    const raf = vi.spyOn(globalThis, 'requestAnimationFrame').mockImplementation((callback) => {
+      frame ??= callback;
+      return 1;
+    });
+
+    render(MiniVisualizer);
+    frame?.(0);
+
+    expect(getContext).toHaveBeenNthCalledWith(1, '2d', expect.any(Object));
+    expect(getContext).toHaveBeenNthCalledWith(2, '2d');
+    expect(ctx.clearRect).toHaveBeenCalled();
+    getContext.mockRestore();
+    raf.mockRestore();
+  });
 });

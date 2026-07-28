@@ -2,13 +2,17 @@
   /**
    * Compact spectrum visualizer for the mini player.
    *
-   * Consumes the shared FFT store. It does not own playback IPC, so
-    * it remains accurate across route and mini-player window changes.
+   * Consumes the shared FFT store. Always renders in black — does NOT
+   * follow the user's color/aurora settings (those apply only to Now
+   * Playing and fullscreen).
    */
   import { onMount, onDestroy } from 'svelte';
-  import { frequencyData, currentTrack } from '@features/player/stores/player';
+  import { get } from 'svelte/store';
+  import { frequencyData, currentTrack, visualizerReactivity } from '@features/player/stores/player';
+  import { pollRemoteFftFrame } from '@features/player/stores/remotePlayer';
   import { renderBars } from '@features/player/visualizers/bars';
   import { limitFrequencyRange, createActiveRange, type ActiveRangeState } from '@features/player/visualizers/activeRange';
+  import { analyzeSpectrum } from '@features/player/visualizers/analyzeSpectrum';
   import type { VisualizerTheme } from '@features/player/visualizers/types';
   import type { FrequencyData } from '@shared/types/models';
 
@@ -17,27 +21,38 @@
 
   const activeRange: ActiveRangeState = createActiveRange();
 
-  // Local reference to frequency data for the rAF loop (avoids reactive churn
-  // inside the animation frame — same pattern as the main Visualizer).
-  let currentData: FrequencyData | null = null;
-  $: if ($frequencyData) currentData = $frequencyData;
+  // ── Cached reactive values for the rAF hot path ───────────────────
+  // Reading `$store` inside the rAF loop triggers Svelte dependency
+  // tracking on every frame. We mirror the stores into plain locals and
+  // read the locals inside renderFrame so the rAF loop is reactivity-free.
+  let cachedTrackId: string | undefined = undefined;
+  let cachedReactivity = 1;
+  $: cachedTrackId = $currentTrack?.id;
+  $: cachedReactivity = $visualizerReactivity;
 
-  // Compact theme: thinner bars and tighter gaps suit the small canvas.
+  // Fixed black theme — the mini visualizer never changes color.
   const theme: VisualizerTheme = {
-    accentColor: 'var(--skin-accent, #6366f1)',
+    accentColor: '#000000',
     barGap: 1,
     barMinHeight: 1,
+    palette: ['#000000'],
+    reactivity: 1,
   };
 
   let cachedCtx: CanvasRenderingContext2D | null = null;
 
   function getCtx(): CanvasRenderingContext2D | null {
     if (cachedCtx) return cachedCtx;
-    cachedCtx = canvas.getContext('2d', {
-      alpha: true, // mini viz floats over the skin, needs transparency
-      desynchronized: true,
-      willReadFrequently: false,
-    }) as CanvasRenderingContext2D | null;
+    try {
+      cachedCtx = canvas.getContext('2d', {
+        alpha: true,
+        desynchronized: true,
+        willReadFrequently: false,
+      }) as CanvasRenderingContext2D | null;
+    } catch {
+      cachedCtx = null;
+    }
+    cachedCtx ??= canvas.getContext('2d');
     return cachedCtx;
   }
 
@@ -54,12 +69,20 @@
       }
       canvas.width = Math.max(1, width);
       canvas.height = Math.max(1, height);
-      cachedCtx = null; // canvas resize resets the context
+      cachedCtx = null;
     }
   }
 
   function renderFrame(): void {
     if (!canvas) return;
+    // Poll the remote AnalyserNode (if active) so FFT data is fresh for this
+    // render frame. The guard inside pollRemoteFftFrame ensures the analyser
+    // is read at most ONCE per rAF batch even when multiple visualizers call it.
+    pollRemoteFftFrame();
+    // Skip when the tab/window is hidden — the mini visualizer is cheap but
+    // there's no point painting into a hidden surface, and skipping frees
+    // CPU for the fullscreen overlay when the user has it open.
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (canvas.width === 0 || canvas.height === 0) {
       const parent = canvas.parentElement;
       if (parent) {
@@ -77,9 +100,13 @@
     const ctx = getCtx();
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const raw = currentData ?? { bins: new Float32Array(0), sampleRate: 44100, peak: 0 };
-    const data = limitFrequencyRange(activeRange, raw, $currentTrack?.id);
-    renderBars(ctx, canvas.width, canvas.height, data, theme);
+
+    const fftData = get(frequencyData);
+    const raw = fftData ?? { bins: new Float32Array(0), sampleRate: 44100, peak: 0 };
+    const data = limitFrequencyRange(activeRange, raw, cachedTrackId);
+    const analysis = analyzeSpectrum(data);
+    theme.reactivity = Math.min(2, Math.max(0.5, cachedReactivity));
+    renderBars(ctx, canvas.width, canvas.height, data, theme, analysis);
   }
 
   let ro: ResizeObserver | null = null;

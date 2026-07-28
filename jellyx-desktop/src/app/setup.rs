@@ -9,6 +9,7 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::errors::types::PersistenceError;
+use crate::focus::service::{FocusService, SystemClock};
 use crate::ipc::commands::AppState;
 use crate::library::{LibraryService, PlaylistService, SettingsService};
 use crate::persistence::db::Database;
@@ -80,6 +81,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             let library = Arc::new(LibraryService::new(db.clone()));
             let playlist = Arc::new(PlaylistService::new(db.clone()));
             let settings = Arc::new(SettingsService::new(db.clone()));
+            let focus = Arc::new(FocusService::new(db.clone(), SystemClock));
             // Remote telemetry is disabled unless this persisted setting is
             // explicitly true and JELLYX_SENTRY_DSN is configured.
             let telemetry_enabled = settings
@@ -119,6 +121,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
                 settings,
                 scanner: Arc::new(scanner),
                 updater: updater.clone(),
+                focus,
             });
 
             // Spawn the startup + periodic update check.
@@ -161,11 +164,21 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if window.label() != "main" || !matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                return;
+            }
+            let state = window.state::<AppState>();
+            if let Err(error) = state.focus.close_active() {
+                eprintln!("warn: failed to close active Focus session: {error}");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             crate::ipc::commands::play,
             crate::ipc::commands::play_local,
             crate::ipc::commands::pause,
             crate::ipc::commands::resume,
+            crate::ipc::commands::stop,
             crate::ipc::commands::next,
             crate::ipc::commands::previous,
             crate::ipc::commands::seek,
@@ -173,6 +186,9 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             crate::ipc::commands::search,
             crate::ipc::commands::search_grouped,
             crate::ipc::commands::get_artist_detail,
+            crate::ipc::commands::get_cached_artist_detail,
+            crate::ipc::commands::refresh_artist_detail,
+            crate::ipc::commands::get_stale_favorite_artist_ids,
             crate::ipc::commands::get_album_detail,
             crate::ipc::commands::play_album,
             crate::ipc::commands::add_to_queue,
@@ -183,12 +199,30 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             crate::ipc::commands::play_next_with_track,
             crate::ipc::commands::get_queue,
             crate::ipc::commands::get_version,
+            // Focus lifecycle, recovery, preferences, history, and playback acknowledgements
+            crate::ipc::commands::start_focus_session,
+            crate::ipc::commands::pause_focus,
+            crate::ipc::commands::resume_focus,
+            crate::ipc::commands::skip_focus,
+            crate::ipc::commands::end_focus,
+            crate::ipc::commands::discard_focus,
+            crate::ipc::commands::degrade_focus_playback,
+            crate::ipc::commands::ack_focus_playback,
+            crate::ipc::commands::capture_focus_item,
+            crate::ipc::commands::recover_focus,
+            crate::ipc::commands::get_active_focus,
+            crate::ipc::commands::list_focus_sessions,
+            crate::ipc::commands::delete_focus_session,
+            crate::ipc::commands::get_focus_preferences,
+            crate::ipc::commands::set_focus_preferences,
             crate::ipc::commands::get_failure_diagnostics,
             crate::ipc::commands::get_telemetry_settings,
             crate::ipc::commands::set_telemetry_enabled,
             crate::ipc::commands::report_remote_audio_playback_failure,
             crate::ipc::commands::report_remote_audio_playback_runtime_failure,
             crate::ipc::commands::report_remote_audio_playback_success,
+            crate::ipc::commands::re_resolve_stream,
+            crate::ipc::commands::start_remote_fft,
             crate::ipc::commands::open_mini_player,
             crate::ipc::commands::restore_full_player,
             // Library commands

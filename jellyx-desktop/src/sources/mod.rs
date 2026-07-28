@@ -39,12 +39,25 @@ pub trait SourceResolver: Send + Sync {
     /// only need the playable stream URL. The default implementation delegates
     /// to `resolve()` and extracts `stream_url`; resolvers should override this
     /// with a lighter-weight command (e.g. `--print %(url)s`) when possible.
+    #[allow(dead_code)]
     fn resolve_stream_url(&self, id: &str) -> Result<String, SourceError> {
+        self.resolve_stream_url_with_refresh(id, false)
+    }
+
+    /// Resolve only the stream URL, optionally bypassing the resolver cache.
+    fn resolve_stream_url_with_refresh(
+        &self,
+        id: &str,
+        _force_refresh: bool,
+    ) -> Result<String, SourceError> {
         let track = self.resolve(id)?;
         track
             .stream_url
             .ok_or_else(|| SourceError::ResolveError("no stream URL".into()))
     }
+
+    /// Remove a cached stream URL entry. Resolvers without a cache need no action.
+    fn invalidate_stream_cache(&self, _id: &str) {}
 
     /// Search for playlists matching the given query.
     /// Default implementation returns an empty list — resolvers that
@@ -126,6 +139,46 @@ impl SourceRegistry {
         all_tracks
     }
 
+    /// Search all enabled sources, returning merged tracks AND the set of
+    /// source names that failed. Used by the authoritative artist-detail
+    /// refresh so callers can distinguish a partial failure (some sources
+    /// errored but others returned data) from a clean empty result.
+    ///
+    /// `failed_sources` contains the `{:?}`-formatted source name for each
+    /// resolver whose `search` returned `Err`. Local is never reported as
+    /// failed here because the local library read in the artist-detail path
+    /// is handled separately by `LibraryService::get_artist_detail`.
+    pub fn search_all_enabled_with_failures(
+        &self,
+        query: &str,
+        enabled_sources: Option<&std::collections::HashSet<String>>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<Track>, Vec<String>) {
+        let mut all_tracks = Vec::new();
+        let mut failed_sources = Vec::new();
+
+        for resolver in &self.resolvers {
+            let source_name = format!("{:?}", resolver.source_type());
+            let is_enabled = resolver.source_type() == Source::Local
+                || enabled_sources.map_or(true, |set| set.contains(&source_name));
+
+            if !is_enabled {
+                continue;
+            }
+
+            match resolver.search(query, offset, limit) {
+                Ok(tracks) => all_tracks.extend(tracks),
+                Err(e) => {
+                    eprintln!("Search failed for {:?}: {:?}", resolver.source_type(), e);
+                    failed_sources.push(source_name);
+                }
+            }
+        }
+
+        (all_tracks, failed_sources)
+    }
+
     /// Search for playlists across all registered sources and merge results,
     /// filtering by enabled sources.
     pub fn search_playlists_all_enabled(
@@ -176,12 +229,33 @@ impl SourceRegistry {
     /// Routes to the first resolver matching the given source type. This is the
     /// fast path used by `play_stream()` when the Track metadata is already known.
     pub fn resolve_stream_url(&self, source: &Source, id: &str) -> Result<String, SourceError> {
+        self.resolve_stream_url_with_refresh(source, id, false)
+    }
+
+    /// Resolve a stream URL and optionally force the matching resolver to refresh it.
+    pub fn resolve_stream_url_with_refresh(
+        &self,
+        source: &Source,
+        id: &str,
+        force_refresh: bool,
+    ) -> Result<String, SourceError> {
         for resolver in &self.resolvers {
             if resolver.source_type() == *source {
-                return resolver.resolve_stream_url(id);
+                return resolver.resolve_stream_url_with_refresh(id, force_refresh);
             }
         }
         Err(SourceError::UnsupportedSource)
+    }
+
+    /// Remove a cached URL from the resolver that owns the source.
+    pub fn invalidate_stream_cache(&self, source: &Source, id: &str) {
+        if let Some(resolver) = self
+            .resolvers
+            .iter()
+            .find(|resolver| resolver.source_type() == *source)
+        {
+            resolver.invalidate_stream_cache(id);
+        }
     }
 
     /// Try to resolve a track ID through every registered resolver.
@@ -278,6 +352,29 @@ mod tests {
         }
     }
 
+    /// A resolver that always fails its search — used to verify
+    /// per-source failure reporting.
+    struct FailingResolver;
+
+    impl SourceResolver for FailingResolver {
+        fn source_type(&self) -> Source {
+            Source::YouTube
+        }
+
+        fn search(
+            &self,
+            _query: &str,
+            _offset: usize,
+            _limit: usize,
+        ) -> Result<Vec<Track>, SourceError> {
+            Err(SourceError::ResolveError("boom".into()))
+        }
+
+        fn resolve(&self, _id: &str) -> Result<Track, SourceError> {
+            Err(SourceError::UnsupportedSource)
+        }
+    }
+
     #[test]
     fn default_search_playlists_returns_empty() {
         let resolver = StubResolver;
@@ -353,5 +450,67 @@ mod tests {
             matches!(result, Err(SourceError::UnsupportedSource)),
             "No resolver registered for YouTube should return UnsupportedSource"
         );
+    }
+
+    #[test]
+    fn search_all_enabled_with_failures_reports_failed_sources() {
+        let mut registry = SourceRegistry::new();
+        registry.register(Box::new(StubResolver));
+        registry.register(Box::new(FailingResolver));
+
+        let (tracks, failed) = registry.search_all_enabled_with_failures("test", None, 0, 50);
+        assert!(tracks.is_empty());
+        assert_eq!(failed, vec!["YouTube".to_string()]);
+    }
+
+    #[test]
+    fn search_all_enabled_with_failures_merges_successful_results() {
+        struct OkResolver;
+        impl SourceResolver for OkResolver {
+            fn source_type(&self) -> Source {
+                Source::SoundCloud
+            }
+            fn search(&self, _q: &str, _o: usize, _l: usize) -> Result<Vec<Track>, SourceError> {
+                Ok(vec![Track {
+                    id: "sc-1".into(),
+                    source: Source::SoundCloud,
+                    source_id: "sc-1".into(),
+                    title: "Song".into(),
+                    artist: "Artist".into(),
+                    album: None,
+                    duration: None,
+                    thumbnail: None,
+                    stream_url: None,
+                    local_path: None,
+                    playlist_id: None,
+                    metadata: std::collections::HashMap::new(),
+                }])
+            }
+            fn resolve(&self, _id: &str) -> Result<Track, SourceError> {
+                Err(SourceError::UnsupportedSource)
+            }
+        }
+
+        let mut registry = SourceRegistry::new();
+        registry.register(Box::new(OkResolver));
+        registry.register(Box::new(FailingResolver));
+
+        let (tracks, failed) = registry.search_all_enabled_with_failures("test", None, 0, 50);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(failed, vec!["YouTube".to_string()]);
+    }
+
+    #[test]
+    fn search_all_enabled_with_failures_skips_disabled_remote_sources() {
+        let mut registry = SourceRegistry::new();
+        registry.register(Box::new(FailingResolver));
+
+        let mut enabled = std::collections::HashSet::new();
+        enabled.insert("Local".to_string());
+
+        let (tracks, failed) =
+            registry.search_all_enabled_with_failures("test", Some(&enabled), 0, 50);
+        assert!(tracks.is_empty());
+        assert!(failed.is_empty(), "disabled YouTube should not be queried");
     }
 }

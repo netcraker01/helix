@@ -11,6 +11,9 @@ import {
   playAlbum,
   playStream,
   isLatestStreamRequest,
+  getCachedArtistDetail,
+  refreshArtistDetail,
+  getStaleFavoriteArtistIds,
 } from '@services/commands';
 
 const mocks = vi.hoisted(() => ({
@@ -87,6 +90,52 @@ describe('Grouped search commands', () => {
     expect(result).toEqual(expected);
   });
 
+  it('getCachedArtistDetail invokes get_cached_artist_detail with id', async () => {
+    const expected = {
+      id: 'artist:queen',
+      name: 'Queen',
+      thumbnail: null,
+      topTracks: [],
+      albums: [],
+    };
+    mocks.invokeCommand.mockResolvedValueOnce(expected);
+
+    const result = await getCachedArtistDetail('artist:queen');
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('get_cached_artist_detail', { id: 'artist:queen' });
+    expect(result).toEqual(expected);
+  });
+
+  it('getCachedArtistDetail resolves null when uncached', async () => {
+    mocks.invokeCommand.mockResolvedValueOnce(null);
+    const result = await getCachedArtistDetail('artist:ghost');
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('get_cached_artist_detail', { id: 'artist:ghost' });
+    expect(result).toBeNull();
+  });
+
+  it('refreshArtistDetail invokes refresh_artist_detail with id', async () => {
+    const expected = {
+      id: 'artist:queen',
+      name: 'Queen',
+      thumbnail: null,
+      topTracks: [],
+      albums: [],
+    };
+    mocks.invokeCommand.mockResolvedValueOnce(expected);
+
+    const result = await refreshArtistDetail('artist:queen');
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('refresh_artist_detail', { id: 'artist:queen' });
+    expect(result).toEqual(expected);
+  });
+
+  it('getStaleFavoriteArtistIds invokes get_stale_favorite_artist_ids', async () => {
+    mocks.invokeCommand.mockResolvedValueOnce(['artist:queen', 'artist:daft-punk']);
+    const result = await getStaleFavoriteArtistIds();
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('get_stale_favorite_artist_ids');
+    expect(result).toEqual(['artist:queen', 'artist:daft-punk']);
+  });
+
   it('getAlbumDetail invokes get_album_detail with id', async () => {
     const expected = {
       id: 'album:discovery:daft-punk',
@@ -148,6 +197,18 @@ describe('Grouped search commands', () => {
     expect(secondId).toBeGreaterThan(firstId);
     expect(isLatestStreamRequest(firstId)).toBe(false);
     expect(isLatestStreamRequest(secondId)).toBe(true);
+  });
+
+  it('reResolveStream invokes re_resolve_stream with track and request id', async () => {
+    const expected = { streamUrl: 'http://127.0.0.1:8765/proxy?fresh', proxyCapability: 'cap' };
+    mocks.invokeCommand.mockResolvedValueOnce(expected);
+    const { reResolveStream } = await import('@services/commands');
+    const track = { id: 't1', sourceId: 'yt-id', source: 'YouTube' } as any;
+
+    const result = await reResolveStream(track, 7);
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('re_resolve_stream', { track, streamRequestId: 7 });
+    expect(result).toEqual(expected);
   });
 
   it('openMiniPlayer invokes open_mini_player', async () => {

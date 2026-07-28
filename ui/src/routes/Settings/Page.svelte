@@ -3,8 +3,20 @@
   import { t, locale, switchLocale } from '@i18n';
   import { getVersion, getSourceSettings, setSourceEnabled, getAudioSettings, getTelemetrySettings, setTelemetryEnabled, getFailureDiagnostics } from '@services/commands';
   import type { SourceSetting, FailureDiagnostics } from '@services/commands';
-  import { normalizeAudio, toggleNormalizeAudio, cinematicMode, toggleCinematicMode, cinematicIntensity, setCinematicIntensity } from '@features/player/stores/player';
-  import { Library, Languages, Plug, Volume2, Monitor, Github, ExternalLink, Palette, Activity } from 'lucide-svelte';
+  import {
+    normalizeAudio,
+    toggleNormalizeAudio,
+    cinematicMode,
+    toggleCinematicMode,
+    cinematicIntensity,
+    setCinematicIntensity,
+    vizColor,
+    vizColorMode,
+    auroraSpeed,
+    auroraBeatMode,
+    visualizerReactivity,
+  } from '@features/player/stores/player';
+  import { Library, Languages, Plug, Volume2, Monitor, Github, ExternalLink, Palette, Activity, SlidersHorizontal } from 'lucide-svelte';
   import { MINI_PLAYER_SCALE_BOUNDS, MINI_PLAYER_SKINS, activateMiniPlayerSkin, miniPlayerScale, selectedMiniPlayerSkinId, setMiniPlayerScale } from '@features/mini-player/skins';
   import { getMigratedItem, setMigratedItem } from '@shared/utils/storage';
 
@@ -145,6 +157,30 @@
     setMiniPlayerScale(Number(input.value));
   }
 
+  function handleVizColor(e: Event) {
+    const input = e.target as HTMLInputElement;
+    vizColor.set(input.value);
+  }
+
+  function handleVizColorMode(mode: 'fixed' | 'aurora') {
+    vizColorMode.set(mode);
+  }
+
+  function handleAuroraSpeed(e: Event) {
+    const input = e.target as HTMLInputElement;
+    auroraSpeed.set(Number(input.value));
+  }
+
+  function handleAuroraBeatMode(e: Event) {
+    const input = e.target as HTMLInputElement;
+    auroraBeatMode.set(input.checked);
+  }
+
+  function handleVisualizerReactivity(e: Event) {
+    const input = e.target as HTMLInputElement;
+    visualizerReactivity.set(Number(input.value));
+  }
+
   const SUPPORTED_LOCALES = [
     { code: 'en', label: 'English' },
     { code: 'es', label: 'Español' },
@@ -264,6 +300,88 @@
       </div>
       <p class="section-desc">{$t('settings.hide_title_bar_desc')}</p>
     {/if}
+  </section>
+
+  <section class="settings-section">
+    <div class="section-header">
+      <SlidersHorizontal size={20} />
+      <h2>{$t('settings.visualizer.title')}</h2>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">{$t('settings.visualizer.colorMode')}</span>
+      <div class="segmented-control">
+        <button
+          type="button"
+          class:active={$vizColorMode === 'fixed'}
+          on:click={() => handleVizColorMode('fixed')}
+        >
+          {$t('settings.visualizer.colorModeOptions.fixed')}
+        </button>
+        <button
+          type="button"
+          class:active={$vizColorMode === 'aurora'}
+          on:click={() => handleVizColorMode('aurora')}
+        >
+          {$t('settings.visualizer.colorModeOptions.aurora')}
+        </button>
+      </div>
+    </div>
+    {#if $vizColorMode === 'fixed'}
+      <div class="setting-row">
+        <span class="setting-label">{$t('settings.visualizer.color')}</span>
+        <input
+          type="color"
+          value={$vizColor}
+          on:input={handleVizColor}
+          aria-label={$t('settings.visualizer.color')}
+        />
+      </div>
+    {/if}
+    {#if $vizColorMode === 'aurora'}
+      <div class="setting-row">
+        <span class="setting-label">{$t('settings.visualizer.auroraBeatMode')}</span>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={$auroraBeatMode}
+            on:change={handleAuroraBeatMode}
+            aria-label={$t('settings.visualizer.auroraBeatMode')}
+          />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <p class="section-desc">{$t('settings.visualizer.auroraBeatModeHint')}</p>
+      <div class="setting-row">
+        <span class="setting-label">{$t('settings.visualizer.auroraSpeed')}</span>
+        <input
+          class="slider"
+          type="range"
+          min="0.5"
+          max="2"
+          step="0.1"
+          value={$auroraSpeed}
+          on:input={handleAuroraSpeed}
+          aria-label={$t('settings.visualizer.auroraSpeed')}
+        />
+        <span class="setting-value">{$auroraSpeed.toFixed(1)}</span>
+      </div>
+      <p class="section-desc">{$t('settings.visualizer.auroraSpeedHint')}</p>
+    {/if}
+    <div class="setting-row">
+      <span class="setting-label">{$t('settings.visualizer.reactivity')}</span>
+      <input
+        class="slider"
+        type="range"
+        min="0.5"
+        max="2"
+        step="0.1"
+        value={$visualizerReactivity}
+        on:input={handleVisualizerReactivity}
+        aria-label={$t('settings.visualizer.reactivity')}
+      />
+      <span class="setting-value">{$visualizerReactivity.toFixed(1)}</span>
+    </div>
+    <p class="section-desc">{$t('settings.visualizer.reactivityHint')}</p>
   </section>
 
   <section class="settings-section">
@@ -547,6 +665,52 @@
   .activate-skin:disabled {
     cursor: default;
     opacity: 0.65;
+  }
+
+  .segmented-control {
+    display: flex;
+    background: var(--bg-elevated, #1f2937);
+    border: 1px solid var(--border-color, #374151);
+    border-radius: 999px;
+    padding: 0.2rem;
+    gap: 0.2rem;
+  }
+
+  .segmented-control button {
+    background: transparent;
+    border: none;
+    color: var(--text-secondary, #9ca3af);
+    font-size: 0.85rem;
+    padding: 0.35rem 0.8rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .segmented-control button.active {
+    background: var(--color-accent, #6366f1);
+    color: white;
+  }
+
+  input[type='color'] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 2.5rem;
+    height: 1.75rem;
+    padding: 0;
+    border: 1px solid var(--border-color, #374151);
+    border-radius: 4px;
+    background: none;
+    cursor: pointer;
+  }
+
+  input[type='color']::-webkit-color-swatch-wrapper {
+    padding: 0;
+  }
+
+  input[type='color']::-webkit-color-swatch {
+    border: none;
+    border-radius: 3px;
   }
 
   .diagnostics-refresh {

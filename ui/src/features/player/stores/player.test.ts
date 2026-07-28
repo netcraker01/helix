@@ -6,6 +6,7 @@
  * at the IPC boundary (fix for local playback clamping to max).
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { get } from 'svelte/store';
 import {
   playTrack,
   setVolume,
@@ -156,6 +157,31 @@ describe('player event bootstrap FFT ownership', () => {
     mocks.isLatestStreamRequest.mockReturnValue(true);
   }
 
+  it('registers and publishes local FFT frames before player or visualizer initialization', async () => {
+    prepareBootstrapMocks();
+    let onFrame: ((data: FrequencyData) => void) | undefined;
+    mocks.onFftFrame.mockImplementation(async (callback) => {
+      onFrame = callback;
+      return vi.fn();
+    });
+    const {
+      frequencyData,
+      initLocalFft,
+      selectFftSource,
+    } = await import('./player');
+
+    selectFftSource('remote');
+    selectFftSource('local');
+    await initLocalFft();
+    onFrame?.({ bins: new Float32Array([0.25, 0.5]), sampleRate: 48_000, peak: 0.5 });
+
+    const value = get(frequencyData);
+    expect(mocks.onFftFrame).toHaveBeenCalledTimes(1);
+    expect(value?.sampleRate).toBe(48_000);
+    expect(Array.from(value?.bins ?? [])).toEqual([0.25, 0.5]);
+    expect(mocks.onTrackChanged).not.toHaveBeenCalled();
+  });
+
   it('starts one local listener at bootstrap, publishes frames without a visualizer, and gates stale sources', async () => {
     vi.resetModules();
     vi.clearAllMocks();
@@ -214,6 +240,21 @@ describe('player event bootstrap FFT ownership', () => {
     expect(mocks.onTrackChanged).toHaveBeenCalledTimes(1);
   });
 
+  it('does not tear down the bootstrap-owned FFT listener when another listener fails', async () => {
+    prepareBootstrapMocks();
+    const stopFftListener = vi.fn();
+    mocks.onFftFrame.mockResolvedValue(stopFftListener);
+    mocks.onStateChanged.mockRejectedValueOnce(new Error('state listener unavailable'));
+    const { initLocalFft, initPlayerEvents } = await import('./player');
+
+    await initLocalFft();
+    await expect(initPlayerEvents()).rejects.toThrow('state listener unavailable');
+    await initLocalFft();
+
+    expect(mocks.onFftFrame).toHaveBeenCalledTimes(1);
+    expect(stopFftListener).not.toHaveBeenCalled();
+  });
+
   it('shares one in-flight initialization across concurrent callers', async () => {
     prepareBootstrapMocks();
     let resolveListener!: (unlisten: () => void) => void;
@@ -231,21 +272,29 @@ describe('player event bootstrap FFT ownership', () => {
     expect(mocks.onTrackChanged).toHaveBeenCalledTimes(1);
   });
 
-  it('cleans partial setup before retrying so listeners are not duplicated', async () => {
+  it('keeps the fallback FFT listener alive when later player setup fails', async () => {
     prepareBootstrapMocks();
     const stopListener = vi.fn();
     const stopTrackChanged = vi.fn();
-    mocks.onFftFrame.mockResolvedValue(stopListener);
+    let onFrame: ((data: FrequencyData) => void) | undefined;
+    mocks.onFftFrame.mockImplementation(async (callback) => {
+      onFrame = callback;
+      return stopListener;
+    });
     mocks.onTrackChanged.mockResolvedValue(stopTrackChanged);
     mocks.onStateChanged.mockRejectedValueOnce(new Error('state listener unavailable'));
-    const { initPlayerEvents } = await import('./player');
+    const { frequencyData, initPlayerEvents } = await import('./player');
 
     await expect(initPlayerEvents()).rejects.toThrow('state listener unavailable');
+    onFrame?.({ bins: new Float32Array([0.4]), sampleRate: 48_000, peak: 0.4 });
+
+    expect(stopListener).not.toHaveBeenCalled();
+    expect(get(frequencyData)?.bins[0]).toBeCloseTo(0.4);
+
     await initPlayerEvents();
 
-    expect(stopListener).toHaveBeenCalledTimes(1);
     expect(stopTrackChanged).toHaveBeenCalledTimes(1);
-    expect(mocks.onFftFrame).toHaveBeenCalledTimes(2);
+    expect(mocks.onFftFrame).toHaveBeenCalledTimes(1);
     expect(mocks.onTrackChanged).toHaveBeenCalledTimes(2);
     expect(mocks.onStateChanged).toHaveBeenCalledTimes(2);
   });

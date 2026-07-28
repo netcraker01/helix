@@ -16,7 +16,17 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
+use crate::audio::decoder::SymphoniaDecoder;
+use crate::audio::fft::AudioAnalyzer;
+use crate::audio::http_stream::HttpStreamReader;
 use crate::errors::types::AppError;
+use crate::focus::models::{
+    FocusCadence, FocusCaptureKind, FocusEvent, FocusEventKind, FocusMusicStrategy,
+    FocusMutationResult, FocusPlaybackFailure, FocusPreferences, FocusSession, FocusWorkflow,
+};
+use crate::focus::service::{FocusService, FocusServiceError};
 use crate::ipc::dto::{
     AlbumDetail, ArtistDetail, ArtistFavorite as ArtistFavoriteDto, ArtistSummary,
     GroupedSearchResult, HomeSnapshot, PlaylistTrackEntry as PlaylistTrackEntryDto,
@@ -28,10 +38,47 @@ use crate::playback::service::PlaybackService;
 use crate::sources::local::{ScanResult, ScannerService};
 use crate::updater::prefs::{now_iso_utc, now_plus_seconds};
 use crate::updater::service::UpdateService;
+use crate::visualizer::fft_bridge::emit_proxy_fft_frame;
 
 use jellyx_core::models::playlist::Playlist;
 use jellyx_core::models::track::Track;
-use tauri::Manager;
+use symphonia::core::io::MediaSourceStream;
+use tauri::{Emitter, Manager};
+
+const FOCUS_EVENT: &str = "focus-event";
+
+fn emit_focus_result<E>(result: &FocusMutationResult, phase_changed: bool, mut emit: E)
+where
+    E: FnMut(&FocusEvent) -> Result<(), String>,
+{
+    let snapshot = &result.snapshot;
+    let envelope = |kind| FocusEvent {
+        session_id: snapshot.id.clone(),
+        operation_id: result.operation_id.clone(),
+        revision: snapshot.revision,
+        kind,
+    };
+    let _ = emit(&envelope(FocusEventKind::SessionMutation(snapshot.clone())));
+    if phase_changed {
+        let _ = emit(&envelope(FocusEventKind::PhaseChange {
+            phase: snapshot.phase,
+            state: snapshot.state,
+        }));
+    }
+    if let Some(degradation) = snapshot.degradation.clone() {
+        let _ = emit(&envelope(FocusEventKind::Degraded(degradation)));
+    }
+    if let Some(directive) = result.playback_directive.clone() {
+        let _ = emit(&envelope(FocusEventKind::PlaybackDirective(directive)));
+    }
+}
+
+fn emit_focus_mutation(app: &tauri::AppHandle, result: &FocusMutationResult, phase_changed: bool) {
+    emit_focus_result(result, phase_changed, |event| {
+        app.emit(FOCUS_EVENT, event)
+            .map_err(|error| error.to_string())
+    });
+}
 
 /// Application state shared across Tauri commands.
 /// PlaybackService is the single authority for all playback operations.
@@ -39,7 +86,6 @@ use tauri::Manager;
 /// PlaylistService manages user-created playlists and artist favorites.
 /// SettingsService manages source enable/disable state.
 /// ScannerService manages local file scanning.
-/// fft_channel holds the Tauri Channel for binary FFT streaming.
 /// updater runs the channel-aware update check (Phase 1: notify-only).
 pub struct AppState {
     pub playback: Arc<PlaybackService>,
@@ -49,6 +95,66 @@ pub struct AppState {
     pub scanner: Arc<ScannerService>,
     /// Channel-aware updater service (Phase 1: notify-only / open-release-page).
     pub updater: Arc<UpdateService>,
+    /// FocusService is the sole authority for Focus lifecycle and recovery.
+    pub focus: Arc<FocusService>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusCommandError {
+    pub code: &'static str,
+    pub details: Option<&'static str>,
+}
+
+fn focus_error(error: FocusServiceError) -> FocusCommandError {
+    match error {
+        FocusServiceError::NotFound => FocusCommandError {
+            code: "FOCUS_NOT_FOUND",
+            details: None,
+        },
+        FocusServiceError::InvalidTransition { .. } => FocusCommandError {
+            code: "FOCUS_INVALID_TRANSITION",
+            details: None,
+        },
+        FocusServiceError::Persistence(message) if message.contains("stale") => FocusCommandError {
+            code: "FOCUS_REVISION_CONFLICT",
+            details: None,
+        },
+        FocusServiceError::Persistence(_) => FocusCommandError {
+            code: "FOCUS_UNAVAILABLE",
+            details: None,
+        },
+    }
+}
+
+fn start_focus(
+    service: &FocusService,
+    request_id: &str,
+    expected_revision: i64,
+    intention: String,
+    goal: String,
+    first_action: String,
+    workflow: FocusWorkflow,
+    cadence: FocusCadence,
+    music_strategy: FocusMusicStrategy,
+) -> Result<FocusMutationResult, FocusCommandError> {
+    if expected_revision != 0 {
+        return Err(FocusCommandError {
+            code: "FOCUS_REVISION_CONFLICT",
+            details: None,
+        });
+    }
+    service
+        .start_with_playback(
+            request_id,
+            intention,
+            goal,
+            first_action,
+            workflow,
+            cadence,
+            music_strategy,
+        )
+        .map_err(focus_error)
 }
 
 /// Convert a persistence-layer `UserPlaylist` into its IPC DTO form.
@@ -67,8 +173,192 @@ fn playlist_to_dto(pl: crate::persistence::models::UserPlaylist) -> UserPlaylist
 // ── Synchronous commands (fast, in-memory or SQLite) ──────────────────
 
 #[tauri::command]
+pub fn start_focus_session(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    expected_revision: i64,
+    intention: String,
+    goal: String,
+    first_action: String,
+    workflow: FocusWorkflow,
+    cadence: FocusCadence,
+    music_strategy: FocusMusicStrategy,
+) -> Result<FocusMutationResult, FocusCommandError> {
+    let result = start_focus(
+        &state.focus,
+        &request_id,
+        expected_revision,
+        intention,
+        goal,
+        first_action,
+        workflow,
+        cadence,
+        music_strategy,
+    )?;
+    emit_focus_mutation(&app, &result, true);
+    Ok(result)
+}
+
+macro_rules! focus_lifecycle_command {
+    ($name:ident, $method:ident) => {
+        #[tauri::command]
+        pub fn $name(
+            state: tauri::State<AppState>,
+            app: tauri::AppHandle,
+            request_id: String,
+            id: String,
+            expected_revision: i64,
+        ) -> Result<FocusMutationResult, FocusCommandError> {
+            let result = state
+                .focus
+                .$method(&request_id, &id, expected_revision)
+                .map_err(focus_error)?;
+            emit_focus_mutation(&app, &result, true);
+            Ok(result)
+        }
+    };
+}
+
+focus_lifecycle_command!(pause_focus, pause_with_playback);
+focus_lifecycle_command!(resume_focus, resume_with_playback);
+focus_lifecycle_command!(skip_focus, skip_with_playback);
+focus_lifecycle_command!(end_focus, end_with_playback);
+focus_lifecycle_command!(discard_focus, discard_with_playback);
+
+#[tauri::command]
+pub fn degrade_focus_playback(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    failure: FocusPlaybackFailure,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .degrade_playback(&request_id, &id, expected_revision, failure)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn ack_focus_playback(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    directive_id: String,
+    failure: Option<FocusPlaybackFailure>,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .acknowledge_playback(&request_id, &id, expected_revision, &directive_id, failure)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn capture_focus_item(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    kind: FocusCaptureKind,
+    body: String,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .capture(&request_id, &id, expected_revision, kind, body)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn recover_focus(
+    state: tauri::State<AppState>,
+) -> Result<Option<FocusSession>, FocusCommandError> {
+    state.focus.recover().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn get_active_focus(
+    state: tauri::State<AppState>,
+) -> Result<Option<FocusSession>, FocusCommandError> {
+    state.focus.recover().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn list_focus_sessions(
+    state: tauri::State<AppState>,
+    limit: u32,
+) -> Result<Vec<FocusSession>, FocusCommandError> {
+    state.focus.list_sessions(limit).map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn delete_focus_session(
+    state: tauri::State<AppState>,
+    id: String,
+) -> Result<(), FocusCommandError> {
+    state.focus.delete_session(&id).map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn get_focus_preferences(
+    state: tauri::State<AppState>,
+) -> Result<FocusPreferences, FocusCommandError> {
+    state.focus.preferences().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn set_focus_preferences(
+    state: tauri::State<AppState>,
+    preferences: FocusPreferences,
+) -> Result<FocusPreferences, FocusCommandError> {
+    state
+        .focus
+        .set_preferences(preferences)
+        .map_err(focus_error)
+}
+
+#[tauri::command]
 pub fn play(state: tauri::State<AppState>, url: &str) -> Result<(), AppError> {
     state.playback.play(url)
+}
+
+#[tauri::command]
+pub fn stop(state: tauri::State<AppState>) -> Result<(), AppError> {
+    state.playback.stop()
 }
 
 #[tauri::command]
@@ -177,6 +467,108 @@ pub fn report_remote_audio_playback_success(elapsed_ms: u64) {
 #[tauri::command]
 pub fn report_remote_audio_playback_runtime_failure(elapsed_ms: u64) {
     record_remote_audio_playback("audio_runtime", elapsed_ms, false);
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReResolvedStream {
+    stream_url: String,
+    proxy_capability: Option<String>,
+}
+
+/// Re-resolve a remote stream URL while bypassing resolver caches.
+#[tauri::command]
+pub async fn re_resolve_stream(
+    state: tauri::State<'_, AppState>,
+    track: Track,
+    stream_request_id: u64,
+) -> Result<ReResolvedStream, AppError> {
+    let playback = state.playback.clone();
+    let (stream_url, proxy_capability) =
+        tokio::task::spawn_blocking(move || playback.re_resolve_stream(track, stream_request_id))
+            .await
+            .map_err(|e| AppError {
+                code: "INTERNAL_ERROR".into(),
+                details: Some(format!("re_resolve_stream task join error: {}", e)),
+            })??;
+    Ok(ReResolvedStream {
+        stream_url,
+        proxy_capability,
+    })
+}
+
+/// Start Rust-side FFT analysis for a remote stream URL.
+///
+/// Downloads the remote audio, decodes it via Symphonia, and emits `"proxy-fft-frame"`
+/// events at the audio's native frame rate (~43 fps for 1024-point FFT at 44100 Hz).
+/// The frontend listens for these events and feeds them to the visualizer as remote FFT data.
+///
+/// This replaces the unreliable WebKitGTK AnalyserNode approach for remote streams.
+/// The command returns immediately after spawning the background task.
+#[tauri::command]
+pub async fn start_remote_fft(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<(), AppError> {
+    tokio::task::spawn_blocking(move || {
+        let fft_size = 1024usize;
+
+        // 1. Download the entire remote audio stream into memory.
+        let reader = match HttpStreamReader::from_url(&url) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("proxy-fft: download failed for {}: {:?}", url, e);
+                return;
+            }
+        };
+
+        // 2. Wrap in MediaSourceStream and probe/open the decoder.
+        let mss = MediaSourceStream::new(Box::new(reader), Default::default());
+        let mut decoder = match SymphoniaDecoder::open_stream(mss, None) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("proxy-fft: decode init failed for {}: {:?}", url, e);
+                return;
+            }
+        };
+
+        let sample_rate = decoder.sample_rate();
+        let mut analyzer = AudioAnalyzer::new(fft_size);
+
+        // Compute real-time frame pacing so FFT frames arrive at ~the same rate
+        // the audio would naturally produce them (e.g. ~43 fps for 1024/44100).
+        let frame_duration =
+            Duration::from_secs_f64(fft_size as f64 / sample_rate.max(1) as f64);
+
+        // 3. Decode → accumulate PCM → compute FFT → emit proxy frame.
+        let mut decode_buf = vec![0.0f32; 16_384];
+        let mut pcm_accum: Vec<f32> = Vec::new();
+
+        loop {
+            let n = match decoder.decode_next(&mut decode_buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("proxy-fft: decode error: {:?}", e);
+                    break;
+                }
+            };
+            pcm_accum.extend_from_slice(&decode_buf[..n]);
+
+            while pcm_accum.len() >= fft_size {
+                let window: Vec<f32> = pcm_accum.drain(..fft_size).collect();
+                let data = analyzer.analyze(&window, sample_rate);
+                if let Err(e) = emit_proxy_fft_frame(&app, &data) {
+                    eprintln!("proxy-fft: emit error: {}", e);
+                }
+                // Pace at the audio frame rate so the visualizer sees
+                // temporally consistent frame intervals.
+                std::thread::sleep(frame_duration);
+            }
+        }
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -764,6 +1156,203 @@ pub async fn get_artist_detail(
             })
         }
     }
+}
+
+/// Return cached artist detail JSON if present, or `None` when no cache
+/// entry exists. The frontend renders cached data immediately and triggers
+/// a background refresh via [`refresh_artist_detail`].
+#[tauri::command]
+pub fn get_cached_artist_detail(
+    state: tauri::State<AppState>,
+    id: String,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let db = state.library.db_handle();
+    let row = db.artist_detail_cache_get(&id).map_err(AppError::from)?;
+    match row {
+        None => Ok(None),
+        Some((json, _fetched_at)) => {
+            let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| AppError {
+                code: "INTERNAL_ERROR".into(),
+                details: Some(format!("cached artist detail JSON parse error: {}", e)),
+            })?;
+            Ok(Some(value))
+        }
+    }
+}
+
+/// Authoritative artist-detail refresh.
+///
+/// Fetches local + remote tracks for the artist, deduplicates by
+/// `(source, source_id)`, and **preserves cached tracks from sources that
+/// failed this refresh** so a partial failure never wipes existing data.
+/// Stores the fresh result in the cache and clears the refresh-start marker.
+#[tauri::command]
+pub async fn refresh_artist_detail(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<ArtistDetail, AppError> {
+    let normalized_name = crate::ipc::dto::denormalize_artist_id(&id).ok_or_else(|| {
+        crate::errors::types::ValidationError::InvalidInput(format!("Invalid artist ID: {}", id))
+    })?;
+
+    let db = state.library.db_handle();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // Mark in-flight so a concurrent refresh can detect it. Safe whether or
+    // not a cache row exists.
+    let _ = db.artist_detail_cache_set_refresh_start(&id, started_at);
+
+    // Load existing cache so we can preserve tracks from sources that fail
+    // this refresh. We only keep the cached Track list (not the stale
+    // albums/thumbnail) — those are recomputed from the fresh tracks.
+    let cached_tracks: Vec<Track> = db
+        .artist_detail_cache_get(&id)
+        .ok()
+        .flatten()
+        .and_then(|(json, _)| serde_json::from_str::<ArtistDetail>(&json).ok())
+        .map(|d| d.top_tracks)
+        .unwrap_or_default();
+
+    // Group cached tracks by (source, source_id) for fast lookup.
+    let mut cached_by_key: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for t in &cached_tracks {
+        cached_by_key.insert((format!("{:?}", t.source), t.source_id.clone()));
+    }
+
+    // Local library tracks (best-effort — a missing local result is not a
+    // hard failure when remote tracks are available).
+    let library = state.library.clone();
+    let id_for_local = id.clone();
+    let local_result =
+        tokio::task::spawn_blocking(move || library.get_artist_detail(&id_for_local))
+            .await
+            .map_err(|e| AppError {
+                code: "INTERNAL_ERROR".into(),
+                details: Some(format!("refresh local join error: {}", e)),
+            })?;
+
+    // Remote tracks from enabled sources, with per-source failures.
+    let enabled_sources = state.settings.get_enabled_sources().unwrap_or_default();
+    let playback = state.playback.clone();
+    let search_name = normalized_name.clone();
+    let (remote_tracks, failed_sources) = tokio::task::spawn_blocking(move || {
+        playback.search_all_tracks_enabled_with_failures(&search_name, &enabled_sources, 0, 50)
+    })
+    .await
+    .map_err(|e| AppError {
+        code: "INTERNAL_ERROR".into(),
+        details: Some(format!("refresh remote join error: {}", e)),
+    })?;
+
+    let failed_set: std::collections::HashSet<String> = failed_sources.into_iter().collect();
+
+    // Match remote tracks to the artist name (case-insensitive).
+    let matching_remote: Vec<Track> = remote_tracks
+        .into_iter()
+        .filter(|t| t.artist.to_lowercase() == normalized_name.to_lowercase())
+        .collect();
+
+    // Build the merged track list + dedup by (source, source_id).
+    let mut merged: Vec<Track> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    // Local tracks first (authoritative when present).
+    let mut local_detail: Option<ArtistDetail> = None;
+    if let Ok(detail) = local_result {
+        for t in detail.top_tracks.iter().cloned() {
+            let key = (format!("{:?}", t.source), t.source_id.clone());
+            if seen.insert(key) {
+                merged.push(t);
+            }
+        }
+        local_detail = Some(detail);
+    }
+
+    // Remote tracks from successful sources.
+    for t in matching_remote {
+        let key = (format!("{:?}", t.source), t.source_id.clone());
+        if seen.insert(key) {
+            merged.push(t);
+        }
+    }
+
+    // Preserve cached tracks whose source FAILED this refresh — partial
+    // failure must not wipe existing data.
+    for t in cached_tracks {
+        let source_name = format!("{:?}", t.source);
+        if failed_set.contains(&source_name) {
+            let key = (source_name.clone(), t.source_id.clone());
+            if seen.insert(key) {
+                merged.push(t);
+            }
+        }
+    }
+
+    // Compute albums from the merged local tracks (remote albums are not
+    // available here; the library service already computed them from local).
+    let albums = local_detail
+        .as_ref()
+        .map(|d| d.albums.clone())
+        .unwrap_or_default();
+
+    let thumbnail = merged.iter().find_map(|t| t.thumbnail.clone());
+    let canonical_name = local_detail
+        .as_ref()
+        .map(|d| d.name.clone())
+        .or_else(|| merged.first().map(|t| t.artist.clone()))
+        .unwrap_or_else(|| normalized_name.clone());
+
+    let fresh = ArtistDetail {
+        id: id.clone(),
+        name: canonical_name,
+        thumbnail,
+        top_tracks: merged,
+        albums,
+    };
+
+    // Persist fresh result and clear the refresh marker. `put` clears the
+    // marker atomically, but we also clear explicitly in case serialization
+    // fails below (the marker should never stay set forever).
+    match serde_json::to_string(&fresh) {
+        Ok(json) => {
+            let fetched_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if let Err(e) = db
+                .artist_detail_cache_put(&id, &json, fetched_at)
+                .map_err(AppError::from)
+            {
+                let _ = db.artist_detail_cache_clear_refresh_start(&id);
+                return Err(e);
+            }
+        }
+        Err(e) => {
+            let _ = db.artist_detail_cache_clear_refresh_start(&id);
+            return Err(AppError {
+                code: "INTERNAL_ERROR".into(),
+                details: Some(format!("refresh artist detail serialization error: {}", e)),
+            });
+        }
+    }
+
+    Ok(fresh)
+}
+
+/// Return favorite artist IDs whose cached detail is older than the
+/// stale threshold (6 hours), plus favorites with no cache yet. Used by
+/// the app startup warmer to pre-warm stale favorites in the background.
+#[tauri::command]
+pub fn get_stale_favorite_artist_ids(
+    state: tauri::State<AppState>,
+) -> Result<Vec<String>, AppError> {
+    const STALE_THRESHOLD_MS: i64 = 6 * 60 * 60 * 1000;
+    let db = state.library.db_handle();
+    db.artist_detail_cache_stale_favorites(STALE_THRESHOLD_MS)
+        .map_err(AppError::from)
 }
 
 /// Get full album detail by album ID.

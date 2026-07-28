@@ -8,7 +8,8 @@
   import Queue from '@features/player/components/Queue.svelte';
   import Visualizer from '@features/player/components/NowPlayingVisualizer.svelte';
   import ListPicker from '@features/playlists/components/ListPicker.svelte';
-  import { ListMusic } from 'lucide-svelte';
+  import { ListMusic, PanelRightClose, PanelRightOpen } from 'lucide-svelte';
+  import { queueVisible } from '@features/player/stores/queuePanel';
 
   $: backgroundArtUrl = $currentTrack ? albumArtUrl($currentTrack.thumbnail) : undefined;
   $: description = $currentTrack?.metadata?.description?.trim() || null;
@@ -42,7 +43,7 @@
   {/if}
 
   {#if $currentTrack}
-    <div class="now-playing-layout">
+    <div class="now-playing-layout" class:queue-hidden={!$queueVisible}>
       <div class="main-section">
         <NowPlayingInfo track={$currentTrack} />
         <div class="controls-section">
@@ -66,8 +67,17 @@
           </div>
         {/if}
       </div>
-      <aside class="queue-section">
-        <Queue />
+      <button
+        type="button"
+        class="queue-toggle"
+        on:click={() => queueVisible.update((visible) => !visible)}
+        aria-label={$queueVisible ? $t('player.hide_queue') : $t('player.show_queue')}
+        title={$queueVisible ? $t('player.hide_queue') : $t('player.show_queue')}
+      >
+        {#if $queueVisible}<PanelRightClose size={18} />{:else}<PanelRightOpen size={18} />{/if}
+      </button>
+      <aside class="queue-section" aria-hidden={!$queueVisible}>
+        {#if $queueVisible}<Queue />{/if}
       </aside>
     </div>
   {:else}
@@ -122,9 +132,14 @@
     position: relative;
     z-index: 1;
     display: grid;
-    grid-template-columns: 1fr 300px;
+    grid-template-columns: minmax(0, 1fr) 280px;
     gap: 1.5rem;
     height: 100%;
+    transition: grid-template-columns 0.25s ease;
+  }
+
+  .now-playing-layout.queue-hidden {
+    grid-template-columns: minmax(0, 1fr) 0;
   }
 
   .main-section {
@@ -189,11 +204,6 @@
     overflow: auto;
   }
 
-  .track-description.empty {
-    color: var(--text-secondary, #94a3b8);
-    font-style: italic;
-  }
-
   .visualizer-section {
     width: 100%;
     min-height: 100px;
@@ -211,18 +221,30 @@
     max-height: calc(100vh - 120px);
   }
 
-  /* Responsive: stack layout on narrow windows */
-  @media (max-width: 860px) {
-    .now-playing-layout {
-      grid-template-columns: 1fr;
-      grid-template-rows: 1fr auto;
-    }
+  .queue-toggle {
+    position: absolute;
+    z-index: 3;
+    top: 0.5rem;
+    right: calc(280px + 0.65rem);
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--border-color, #1f2937);
+    border-radius: 9px;
+    background: var(--bg-surface, #111827);
+    color: var(--text-secondary, #9ca3af);
+    cursor: pointer;
+    transition: right 0.25s ease, color 0.2s, border-color 0.2s;
+  }
 
-    .queue-section {
-      border-left: none;
-      border-top: 1px solid var(--border-color, #1f2937);
-      max-height: 200px;
-    }
+  .queue-hidden .queue-toggle {
+    right: 0.25rem;
+  }
+
+  .queue-toggle:hover {
+    color: var(--color-accent, #6366f1);
+    border-color: var(--color-accent, #6366f1);
   }
 
   @media (max-height: 600px) {

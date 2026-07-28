@@ -12,12 +12,17 @@
  * where the Router context is not needed, and verify the module graph
  * is intact by checking imports resolve.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 
 import App from '../app/App.svelte';
 import Sidebar from '../app/layout/Sidebar.svelte';
 import BottomBar from '../app/layout/BottomBar.svelte';
 import Visualizer from '../features/player/components/Visualizer.svelte';
+import { modoCineActive } from '../features/player/stores/player';
+
+afterEach(() => {
+  modoCineActive.set(false);
+});
 
 describe('App shell module graph', () => {
   it('App.svelte is a valid Svelte component', () => {
@@ -59,5 +64,22 @@ describe('BottomBar renders independently', () => {
     const { container } = render(BottomBar);
     const modoCineBtn = container.querySelector('.modo-cine-btn');
     expect(modoCineBtn).toBeTruthy();
+  });
+});
+
+describe('fullscreen visualizer integration', () => {
+  it('mounts and unmounts the overlay when the shared toggle changes', async () => {
+    const { render, cleanup } = await import('@testing-library/svelte');
+    const { container } = render(App);
+    expect(container.querySelector('.visualizer-embed')).toBeFalsy();
+
+    modoCineActive.set(true);
+    await Promise.resolve();
+    expect(container.querySelector('.visualizer-embed .visualizer-canvas')).toBeTruthy();
+
+    modoCineActive.set(false);
+    await Promise.resolve();
+    expect(container.querySelector('.visualizer-embed')).toBeFalsy();
+    cleanup();
   });
 });

@@ -10,6 +10,7 @@
 mod app;
 mod audio;
 mod errors;
+mod focus;
 mod ipc;
 mod library;
 mod observability;

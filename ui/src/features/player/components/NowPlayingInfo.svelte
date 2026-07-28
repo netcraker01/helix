@@ -144,7 +144,7 @@
   }
 
   .album-art {
-    width: 260px;
+    width: 560px;
     height: 260px;
     border-radius: 16px;
     object-fit: cover;
@@ -162,7 +162,7 @@
   }
 
   .album-art-placeholder {
-    width: 260px;
+    width: 560px;
     height: 260px;
     border-radius: 16px;
     background:

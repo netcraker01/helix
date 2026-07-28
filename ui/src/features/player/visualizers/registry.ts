@@ -17,14 +17,12 @@
  * JSC stack overflows (particles, blobs, streaks, constellation, pulseRing,
  * lavaLamp) still stay out until re-introduced one at a time in a follow-up
  * batch. `radial` and `aurora` were re-introduced as stripped-down,
- * allocation-light versions of their old selves: no `shadowBlur`, no
- * `globalCompositeOperation: 'lighter'`, no per-frame WeakMap state machines.
+ * allocation-light versions of their old selves using ordinary layered draws.
  *
  * `grid` and `tunnel` were added in the second safe batch as stateless
  * pure-Canvas2D renderers: `grid` is a spectrum heatmap matrix, `tunnel` is
  * concentric rings driven by a read-only time term (no spawn queue / particle
- * list). Neither holds per-frame state, avoiding the WeakMap state-machine
- * pattern that contributed to the earlier WebKitGTK crash.
+ * list). Their only temporal state is a bounded interpolation buffer.
  */
 import type { VisualizerRenderer } from './types';
 import { renderBars } from './bars';

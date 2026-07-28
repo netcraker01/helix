@@ -38,7 +38,6 @@ pub struct FftEngine {
 ///
 /// Used for one-shot analysis when you already have PCM samples.
 /// For real-time streaming, use `FftEngine` instead.
-#[allow(dead_code)]
 pub struct AudioAnalyzer {
     fft_size: usize,
     planner: FftPlanner<f64>,
@@ -224,7 +223,6 @@ fn compute_fft(
 }
 
 impl AudioAnalyzer {
-    #[allow(dead_code)]
     pub fn new(fft_size: usize) -> Self {
         Self {
             fft_size,
@@ -233,7 +231,6 @@ impl AudioAnalyzer {
     }
 
     /// Convert PCM samples to frequency spectrum bins (one-shot analysis).
-    #[allow(dead_code)]
     pub fn analyze(&mut self, samples: &[f32], sample_rate: u32) -> FrequencyData {
         compute_fft(samples, self.fft_size, &mut self.planner, sample_rate)
     }
