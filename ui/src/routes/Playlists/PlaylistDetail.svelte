@@ -225,35 +225,67 @@
     dragOver = false;
   }
 
+  function firstUrlLike(value: string | null | undefined): string | null {
+    const text = value?.trim();
+    if (!text) return null;
+
+    // Chrome/WebView2 `DownloadURL` shape: mime:type:url or mime:filename:url
+    if (text.includes(':') && (text.startsWith('text/') || text.startsWith('application/'))) {
+      const lastColon = text.lastIndexOf(':');
+      if (lastColon > 0) {
+        const maybeUrl = text.slice(lastColon + 1).trim();
+        if (/^https?:\/\//i.test(maybeUrl)) return maybeUrl;
+      }
+    }
+
+    const htmlHref = text.match(/href=["']([^"']+)["']/i)?.[1];
+    if (htmlHref) return htmlHref;
+
+    const directUrl = text.match(/https?:\/\/[^\s"'<>]+/i)?.[0];
+    if (directUrl) return directUrl;
+
+    return null;
+  }
+
+  async function extractDroppedUrl(dt: DataTransfer): Promise<string | null> {
+    const directCandidates = [
+      dt.getData('text/uri-list'),
+      dt.getData('URL'),
+      dt.getData('text/x-moz-url'),
+      dt.getData('text'),
+      dt.getData('text/plain'),
+      dt.getData('text/html'),
+      dt.getData('DownloadURL'),
+    ];
+
+    for (const candidate of directCandidates) {
+      const url = firstUrlLike(candidate);
+      if (url) return url;
+    }
+
+    const items = Array.from(dt.items ?? []);
+    for (const item of items) {
+      if (item.kind !== 'string') continue;
+      const value = await new Promise<string>((resolve) => item.getAsString(resolve));
+      const url = firstUrlLike(value);
+      if (url) return url;
+    }
+
+    return null;
+  }
+
   async function handleDrop(e: DragEvent): Promise<void> {
     e.preventDefault();
     dragOver = false;
     if (!e.dataTransfer) return;
 
-    // Try multiple MIME types — different platforms deliver dragged URLs
-    // differently. WebKitGTK uses 'text', WebView2 (Windows) often uses
-    // 'text/uri-list' or 'text/html' (an <a> tag with the URL in href).
-    const candidates = [
-      e.dataTransfer.getData('text/uri-list'),
-      e.dataTransfer.getData('text/x-moz-url'),
-      e.dataTransfer.getData('text'),
-      e.dataTransfer.getData('text/plain'),
-    ];
-
-    // Also try extracting a URL from text/html (Windows drops <a href="...">)
-    const html = e.dataTransfer.getData('text/html');
-    if (html) {
-      const match = html.match(/href=["']([^"']+)["']/i);
-      if (match) candidates.push(match[1]);
+    const url = await extractDroppedUrl(e.dataTransfer);
+    if (url) {
+      await importYouTubeTrack(url);
+      return;
     }
 
-    for (const candidate of candidates) {
-      const url = candidate?.trim();
-      if (url) {
-        await importYouTubeTrack(url);
-        return;
-      }
-    }
+    notifications.push({ type: 'warning', title: 'Import failed', message: 'No YouTube URL found in the dropped content', dismissible: true });
   }
 </script>
 
