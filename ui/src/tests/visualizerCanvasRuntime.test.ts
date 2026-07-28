@@ -107,24 +107,34 @@ describe('visualizer canvas runtime', () => {
     timeoutCallback?.();
   }
 
-  it('sizes Now Playing canvas and draws realistic FFT bins with WebKit fallback', () => {
+  async function renderUntilCanvasDraws(attempts = 4): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      await tick();
+      runNextFrame();
+      if (contexts[0]) return;
+    }
+  }
+
+  it('sizes Now Playing canvas and draws realistic FFT bins with WebKit fallback', async () => {
     const { container } = render(NowPlayingVisualizer);
-    runNextFrame();
+    await renderUntilCanvasDraws();
 
     const canvas = container.querySelector('canvas')!;
     expect(canvas.width).toBe(640);
     expect(canvas.height).toBe(240);
+    expect(contexts[0]).toBeDefined();
     expect(contexts[0].clearRect).toHaveBeenCalled();
     expect(contexts[0].fillRect).toHaveBeenCalled();
   });
 
-  it('sizes mini-player canvas and draws realistic FFT bins with WebKit fallback', () => {
+  it('sizes mini-player canvas and draws realistic FFT bins with WebKit fallback', async () => {
     const { container } = render(MiniVisualizer);
-    runNextFrame();
+    await renderUntilCanvasDraws();
 
     const canvas = container.querySelector('canvas')!;
     expect(canvas.width).toBe(640);
     expect(canvas.height).toBe(240);
+    expect(contexts[0]).toBeDefined();
     expect(contexts[0].clearRect).toHaveBeenCalled();
     expect(contexts[0].fillRect).toHaveBeenCalled();
   });
@@ -132,8 +142,7 @@ describe('visualizer canvas runtime', () => {
   it.each(VISUALIZER_MODES)('draws realistic FFT bins in fullscreen $id mode', async ({ id }) => {
     visualizerMode.set(id);
     const { container } = render(Visualizer);
-    await tick();
-    runNextFrame();
+    await renderUntilCanvasDraws();
 
     const canvas = container.querySelector('canvas')!;
     const context = contexts[0] as unknown as Record<string, ReturnType<typeof vi.fn>>;
