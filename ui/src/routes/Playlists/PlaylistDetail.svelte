@@ -271,6 +271,20 @@
       if (url) return url;
     }
 
+    // Windows/WebView2 can expose dragged browser links as an Internet
+    // Shortcut file (.url) instead of plain text. Read dropped files too.
+    const files = Array.from(dt.files ?? []);
+    for (const file of files) {
+      try {
+        const text = await file.text();
+        const shortcutUrl = text.match(/^URL=(.+)$/im)?.[1]?.trim();
+        const url = firstUrlLike(shortcutUrl ?? text);
+        if (url) return url;
+      } catch {
+        // Ignore unreadable dropped files and keep trying others.
+      }
+    }
+
     return null;
   }
 
