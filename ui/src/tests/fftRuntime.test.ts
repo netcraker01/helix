@@ -65,12 +65,17 @@ describe('local FFT runtime boundary', () => {
       visualizerReactivity,
     } = await import('@features/player/stores/player');
     const input = { bins: new Float32Array([0.08, 0.2, 0.35]), sampleRate: 44_100, peak: 0.35 };
+    // Force a source switch so the publish throttle resets between tests.
+    selectFftSource('remote');
     selectFftSource('local');
+    const nowSpy = vi.spyOn(performance, 'now');
 
     visualizerReactivity.set(0.5);
+    nowSpy.mockReturnValueOnce(1);
     publishFftFrame('local', input);
     const low = Array.from(get(frequencyData)!.bins);
     visualizerReactivity.set(2);
+    nowSpy.mockReturnValueOnce(20);
     publishFftFrame('local', input);
     const high = Array.from(get(frequencyData)!.bins);
 

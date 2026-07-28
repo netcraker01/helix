@@ -16,16 +16,23 @@ describe('Tauri FFT event to canvas runtime', () => {
   const fillRect = vi.fn();
   const clearRect = vi.fn();
   let animationFrame: FrameRequestCallback | undefined;
+  let timeoutCallback: (() => void) | undefined;
 
   beforeEach(() => {
     fillRect.mockClear();
     clearRect.mockClear();
     animationFrame = undefined;
+    timeoutCallback = undefined;
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
       animationFrame = callback;
       return 1;
     }));
     vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    vi.stubGlobal('setTimeout', vi.fn((callback: TimerHandler) => {
+      if (typeof callback === 'function') timeoutCallback = callback as () => void;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    }));
+    vi.stubGlobal('clearTimeout', vi.fn());
     vi.stubGlobal('ResizeObserver', class {
       observe() {}
       disconnect() {}
@@ -64,7 +71,7 @@ describe('Tauri FFT event to canvas runtime', () => {
       peak: 0.51,
     });
     await tick();
-    animationFrame?.(performance.now());
+    timeoutCallback?.();
 
     expect(clearRect).toHaveBeenCalledWith(0, 0, 640, 160);
     expect(fillRect).toHaveBeenCalled();

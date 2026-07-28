@@ -10,7 +10,7 @@ describe('release version', () => {
     }
     const lock = readFileSync(resolve(root, 'Cargo.lock'), 'utf8');
     for (const crate of ['jellyx-cli', 'jellyx-core', 'jellyx-desktop', 'jellyx-ffi']) {
-      expect(lock).toContain(`name = "${crate}"\nversion = "0.4.3"`);
+      expect(lock).toMatch(new RegExp(`name = "${crate}"\\r?\\nversion = "0\\.4\\.3"`));
     }
   });
 });
