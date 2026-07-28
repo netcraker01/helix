@@ -51,16 +51,23 @@ function canvasContext() {
 
 describe('visualizer canvas runtime', () => {
   let callbacks: FrameCallback[];
+  let timeoutCallbacks: Array<() => void>;
   let contexts: CanvasRenderingContext2D[];
 
   beforeEach(() => {
     callbacks = [];
+    timeoutCallbacks = [];
     contexts = [];
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameCallback) => {
       callbacks.push(callback);
       return callbacks.length;
     }));
     vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    vi.stubGlobal('setTimeout', vi.fn((callback: TimerHandler) => {
+      if (typeof callback === 'function') timeoutCallbacks.push(callback as () => void);
+      return timeoutCallbacks.length as unknown as ReturnType<typeof setTimeout>;
+    }));
+    vi.stubGlobal('clearTimeout', vi.fn());
     vi.stubGlobal('ResizeObserver', class {
       observe() {}
       disconnect() {}
@@ -91,8 +98,13 @@ describe('visualizer canvas runtime', () => {
 
   function runNextFrame(): void {
     const callback = callbacks.shift();
-    expect(callback).toBeTypeOf('function');
-    callback?.(performance.now());
+    if (typeof callback === 'function') {
+      callback(performance.now());
+      return;
+    }
+    const timeoutCallback = timeoutCallbacks.shift();
+    expect(timeoutCallback).toBeTypeOf('function');
+    timeoutCallback?.();
   }
 
   it('sizes Now Playing canvas and draws realistic FFT bins with WebKit fallback', () => {
