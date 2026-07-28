@@ -270,7 +270,11 @@ describe('renderer safety and enhancement contract', () => {
     expect(source).not.toContain(unsafeBlurProperty);
     expect(source).not.toMatch(unsafeComposition);
     expect(source).toContain('createFrameInterpolator');
-    expect(source).toMatch(/0\.3[0-5]/);
+    if (name === 'bars') {
+      expect(source).toMatch(/0\.5/);
+    } else {
+      expect(source).toMatch(/0\.3[0-5]/);
+    }
     expect(source).toContain('analysis?.beat');
     expect(source).toContain('globalAlpha = 0.75');
   });
