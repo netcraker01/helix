@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::errors::types::AppError;
+use crate::errors::types::{AppError, ValidationError};
 use crate::ipc::dto::{
     AlbumDetail, ArtistDetail, ArtistFavorite as ArtistFavoriteDto, ArtistSummary,
     GroupedSearchResult, HomeSnapshot, PlaylistTrackEntry as PlaylistTrackEntryDto,
@@ -32,6 +32,11 @@ use crate::updater::service::UpdateService;
 use jellyx_core::models::playlist::Playlist;
 use jellyx_core::models::track::Track;
 use tauri::Manager;
+
+fn parse_source(source: &str) -> Result<jellyx_core::models::source::Source, AppError> {
+    serde_json::from_value(serde_json::Value::String(source.to_owned()))
+        .map_err(|_| ValidationError::InvalidInput(format!("unsupported source: {source}")).into())
+}
 
 /// Application state shared across Tauri commands.
 /// PlaybackService is the single authority for all playback operations.
@@ -960,9 +965,7 @@ pub async fn resolve_playlist(
     source: String,
     url: String,
 ) -> Result<Playlist, AppError> {
-    let source_type: jellyx_core::models::source::Source =
-        serde_json::from_str(&format!("\"{}\"", source))
-            .unwrap_or(jellyx_core::models::source::Source::YouTube);
+    let source_type = parse_source(&source)?;
     let playback = state.playback.clone();
     tokio::task::spawn_blocking(move || {
         playback
@@ -986,9 +989,7 @@ pub async fn play_playlist(
     source: String,
     url: String,
 ) -> Result<(), AppError> {
-    let source_type: jellyx_core::models::source::Source =
-        serde_json::from_str(&format!("\"{}\"", source))
-            .unwrap_or(jellyx_core::models::source::Source::YouTube);
+    let source_type = parse_source(&source)?;
     let playback = state.playback.clone();
     tokio::task::spawn_blocking(move || playback.play_playlist(&source_type, &url))
         .await
@@ -1007,9 +1008,7 @@ pub async fn resolve_track(
     source: String,
     id: String,
 ) -> Result<Track, AppError> {
-    let source_type: jellyx_core::models::source::Source =
-        serde_json::from_str(&format!("\"{}\"", source))
-            .unwrap_or(jellyx_core::models::source::Source::YouTube);
+    let source_type = parse_source(&source)?;
     let playback = state.playback.clone();
     tokio::task::spawn_blocking(move || {
         playback
