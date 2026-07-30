@@ -36,6 +36,28 @@ Many of us open YouTube just to listen to long ambient, focus, lofi, jazz, elect
 
 Jellyx exists for that exact workflow. It focuses on the audio: YouTube, SoundCloud and local files in a native desktop app, without accounts, subscriptions or unnecessary video playback.
 
+## What's New in v0.4.3
+
+### Focus sessions and Pomodoro
+
+Turn a music session into a deliberate work block. Create a Focus session with an intention, goal and first action, then choose whether to keep the current music, use a preset or search for something new.
+
+- **Pomodoro:** four 25-minute work blocks with 5-minute breaks.
+- **Deep Work:** two 90-minute blocks with 15-minute breaks.
+- **Quick Focus:** one 15-minute focused block.
+- Pause, resume, skip phases, capture quick notes or distractions, review completed sessions and recover an unfinished one after restarting the app.
+
+### Playlist workflow
+
+- Add a playlist track to the end of the queue or place it directly after the current track with **Play Next**.
+- Import a YouTube track into a playlist by pasting its URL or dragging a browser link onto the playlist.
+
+### Player and visualizers
+
+- More reliable, adjustable visualizers on Linux and WebKitGTK.
+- Empty spectrum bars no longer consume visual space; active bars expand to use the available width.
+- A wider Now Playing artwork view and a collapsible queue panel.
+
 ## Why Jellyx exists
 
 I built Jellyx because I wanted a calmer way to keep music running in the background during long work sessions.
