@@ -2,6 +2,7 @@
 """Deterministic release-workflow contracts without third-party YAML tooling."""
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -67,7 +68,10 @@ require(macos, "workflow_call:", "macos-dmg.yml")
 if 'tags: ["v*"]' in macos:
     raise SystemExit("macos-dmg.yml must not independently publish tag releases")
 
-version = "0.4.1"
+version_match = re.search(r'^version = "([^"]+)"', (ROOT / "jellyx-desktop/Cargo.toml").read_text(), re.MULTILINE)
+if version_match is None:
+    raise SystemExit("jellyx-desktop/Cargo.toml: missing package version")
+version = version_match.group(1)
 # Generate the release body inline instead of calling the bash script,
 # which fails on Windows runners where bash/git-tag availability is
 # inconsistent. The test only needs to verify that the body contains
