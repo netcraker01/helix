@@ -12,6 +12,7 @@
  */
 import type { FrequencyData } from '@shared/types/models';
 import type { VisualizerTheme } from './types';
+import type { SpectrumAnalysis } from './analyzeSpectrum';
 
 /**
  * Render a left-to-right bar spectrum.
@@ -27,11 +28,12 @@ export function renderBars(
   width: number,
   height: number,
   data: FrequencyData | null,
-  theme: VisualizerTheme
+  theme: VisualizerTheme,
+  analysis?: SpectrumAnalysis
 ): void {
   const barGap = theme.barGap;
   const barMinHeight = theme.barMinHeight;
-  ctx.fillStyle = theme.accentColor;
+  ctx.fillStyle = theme.palette?.[0] ?? theme.accentColor;
 
   // Idle / no-data fallback: draw a small static bar pattern so the canvas
   // never looks completely empty.
@@ -49,11 +51,26 @@ export function renderBars(
   }
 
   const { bins, peak } = data;
-  const maxBars = Math.min(bins.length, Math.max(1, Math.floor(width / 4)));
+  const maxBars = Math.min(bins.length, Math.max(1, Math.floor(width / 6)));
   const groupSize = Math.ceil(bins.length / maxBars);
-  const barWidth = Math.max(1, (width - barGap * (maxBars - 1)) / maxBars);
 
-  for (let i = 0; i < maxBars; i++) {
+  const activeGroups: number[] = [];
+  for (let index = 0; index < maxBars; index++) {
+    const start = index * groupSize;
+    const end = Math.min(start + groupSize, bins.length);
+    for (let bin = start; bin < end; bin++) {
+      if (bins[bin] > 0) {
+        activeGroups.push(index);
+        break;
+      }
+    }
+  }
+  if (!activeGroups.length) return;
+
+  const barWidth = Math.max(1, (width - barGap * (activeGroups.length - 1)) / activeGroups.length);
+
+  for (let drawIndex = 0; drawIndex < activeGroups.length; drawIndex++) {
+    const i = activeGroups[drawIndex];
     let sum = 0;
     let count = 0;
     const groupStart = i * groupSize;
@@ -63,11 +80,12 @@ export function renderBars(
       count++;
     }
     const magnitude = count > 0 ? sum / count : 0;
-    const normalizedHeight = peak > 0 ? magnitude / peak : 0;
+    const normalizedHeight = peak > 0 ? Math.min(1, magnitude / peak) : 0;
     const shaped = Math.pow(normalizedHeight, 0.85);
-    const barHeight = Math.max(barMinHeight, shaped * height * 0.9);
+    const punch = 1 + (analysis?.bass ?? 0) * 0.12 + (analysis?.beat ? 0.2 : 0);
+    const barHeight = Math.min(height, Math.max(barMinHeight, shaped * height * 0.9 * punch));
 
-    const x = i * (barWidth + barGap);
+    const x = drawIndex * (barWidth + barGap);
     const y = height - barHeight;
 
     ctx.globalAlpha = 0.5 + shaped * 0.5;
