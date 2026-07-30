@@ -26,6 +26,10 @@ for workflow, channel in (
 ):
     require(workflow, f"JELLYX_INSTALL_CHANNEL: {channel}", "workflow")
 
+require(windows, "CARGO_INCREMENTAL: 0", "windows.yml deterministic build setting")
+if "Cache Cargo build" in windows or "path: |\n            target" in windows:
+    raise SystemExit("windows.yml: CI builds must not reuse target outputs")
+
 for workflow in (release, windows):
     if "--bundles msi,nsis" in workflow:
         raise SystemExit("Windows artifacts must not share one baked install channel")
