@@ -98,6 +98,15 @@ describe('FFT event payload conversion', () => {
     expect(decoded.bins[0]).toBeCloseTo(0.1, 5);
     expect(decoded.bins[4]).toBeCloseTo(0.5, 5);
   });
+
+  it('rejects legacy casing and malformed values', () => {
+    expect(() => frequencyDataFromFftPayload({
+      bins: [0.2], sample_rate: 44_100, peak: 0.2,
+    })).toThrow(/legacy sample_rate/);
+    expect(() => frequencyDataFromFftPayload({
+      bins: [Number.NaN], sampleRate: 44_100, peak: 0.2,
+    })).toThrow(/finite non-negative/);
+  });
 });
 
 // ── FrequencyData store ──────────────────────────────────

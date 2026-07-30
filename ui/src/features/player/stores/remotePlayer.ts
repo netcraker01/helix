@@ -88,6 +88,31 @@ let fftByteBins: Uint8Array<ArrayBuffer> | null = null;
 /** Reusable Float32Array for publishing to the frequencyData store. */
 let fftFloatBins: Float32Array | null = null;
 
+/** Convert one Web Audio analyser read into the same contract as Rust FFT events. */
+export function readAnalyserFrame(
+  source: Pick<AnalyserNode, 'getByteFrequencyData'>,
+  byteBins: Uint8Array<ArrayBuffer>,
+  floatBins: Float32Array,
+  sampleRate: number,
+  target: FrequencyData = { bins: floatBins, sampleRate, peak: 0 },
+): FrequencyData {
+  if (byteBins.length !== floatBins.length || !Number.isFinite(sampleRate) || sampleRate <= 0) {
+    throw new TypeError('Invalid remote FFT analyser buffers');
+  }
+
+  source.getByteFrequencyData(byteBins);
+  let peak = 0;
+  for (let index = 0; index < byteBins.length; index++) {
+    const value = byteBins[index] / 255;
+    floatBins[index] = value;
+    peak = Math.max(peak, value);
+  }
+  target.bins = floatBins;
+  target.sampleRate = sampleRate;
+  target.peak = peak;
+  return target;
+}
+
 /** FFT size for the remote AnalyserNode. Must be a power of two; 1024
  *  matches the Rust FftEngine size used for local playback so the
  *  visualizer sees the same bin count regardless of source. */
@@ -148,7 +173,7 @@ function startRemoteFftLoop(): void {
   if (!analyser || !fftByteBins || !fftFloatBins) return;
   if (fftRafId !== null) return; // already running
 
-  const sampleRate = audioCtx?.sampleRate ?? 44100;
+  const frame: FrequencyData = { bins: fftFloatBins, sampleRate: audioCtx?.sampleRate ?? 44100, peak: 0 };
 
   const tick = (): void => {
     if (!analyser || !fftByteBins || !fftFloatBins) {
@@ -157,18 +182,13 @@ function startRemoteFftLoop(): void {
     }
     // getByteFrequencyData returns 0..255 magnitudes. Convert to 0..1
     // floats so the visualizer's existing peak-based normalization works.
-    analyser.getByteFrequencyData(fftByteBins);
-    let peak = 0;
-    for (let i = 0; i < fftByteBins.length; i++) {
-      const v = fftByteBins[i] / 255;
-      fftFloatBins[i] = v;
-      if (v > peak) peak = v;
-    }
-    publishFftFrame('remote', {
-      bins: fftFloatBins,
-      sampleRate,
-      peak,
-    });
+    publishFftFrame('remote', readAnalyserFrame(
+      analyser,
+      fftByteBins,
+      fftFloatBins,
+      audioCtx?.sampleRate ?? 44100,
+      frame,
+    ));
     fftRafId = requestAnimationFrame(tick);
   };
   fftRafId = requestAnimationFrame(tick);

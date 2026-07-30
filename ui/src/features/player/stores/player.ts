@@ -22,6 +22,7 @@ import {
 } from './remotePlayer';
 import {
   DEFAULT_VISUALIZER_MODE,
+  isVisualizerModeId,
   type VisualizerModeId,
 } from '../visualizers/registry';
 
@@ -124,6 +125,10 @@ let rollingPeak = 0;
 
 export function publishFftFrame(source: FftSource, data: FrequencyData): void {
   if (activeFftSource !== source) return;
+  if (!Number.isFinite(data.sampleRate) || data.sampleRate <= 0
+    || !Number.isFinite(data.peak) || data.peak < 0) {
+    throw new TypeError('Invalid FFT frame metadata');
+  }
 
   // Rise instantly, decay slowly.
   if (data.peak > rollingPeak) {
@@ -164,11 +169,7 @@ const VISUALIZER_MODE_SUFFIX = 'visualizer-mode';
 function readPersistedVisualizerMode(): VisualizerModeId {
   const raw = getMigratedItem(VISUALIZER_MODE_SUFFIX);
   if (raw == null) return DEFAULT_VISUALIZER_MODE;
-  // Validate against the registry's known ids; ignore anything else.
-  // (We import the mode set lazily to avoid a circular import with the
-  //  registry importing renderers that import types only.)
-  const known: VisualizerModeId[] = ['bars', 'wave', 'mirror'];
-  return (known as readonly string[]).includes(raw) ? (raw as VisualizerModeId) : DEFAULT_VISUALIZER_MODE;
+  return isVisualizerModeId(raw) ? raw : DEFAULT_VISUALIZER_MODE;
 }
 
 /** Currently selected visualizer mode id (persisted to localStorage).
@@ -283,10 +284,15 @@ async function ensureLocalFftListener(): Promise<void> {
   return fftListenerStarting;
 }
 
+/** Register the local FFT consumer independently of player UI/runtime setup. */
+export async function initLocalFft(): Promise<void> {
+  await ensureLocalFftListener();
+}
+
 /** Prepare the local FFT event listener for a new playback. */
 export async function prepareLocalFft(): Promise<void> {
   selectFftSource('local');
-  await ensureLocalFftListener();
+  await initLocalFft();
 }
 
 /**
@@ -302,7 +308,7 @@ async function initializePlayerEvents(): Promise<void> {
     // The FFT stream belongs to playback, not to either visualizer view. Start
     // it before any component mounts so local files update the shared store even
     // while the player is on another route or in the mini-player window.
-    await ensureLocalFftListener();
+    await initLocalFft();
 
     // Track changed — update current track
     unlisten.push(await events.onTrackChanged((track: Track) => {
@@ -408,10 +414,8 @@ async function initializePlayerEvents(): Promise<void> {
     initialized = true;
   } catch (error) {
     for (const stopListening of unlisten) stopListening();
-    if (fftListenerUnlisten) {
-      fftListenerUnlisten();
-      fftListenerUnlisten = null;
-    }
+    // FFT ownership is application-wide. A later player-listener failure must
+    // not tear down a healthy analyser stream established before this attempt.
     throw error;
   }
 }
