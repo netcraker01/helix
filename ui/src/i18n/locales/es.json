@@ -130,7 +130,17 @@
     "diagnostics_error_rate": "Tasa de error observada",
     "diagnostics_unavailable": "Los diagnósticos no están disponibles temporalmente.",
     "diagnostics_refresh": "Actualizar diagnósticos",
-    "diagnostics_refreshing": "Actualizando…"
+    "diagnostics_refreshing": "Actualizando…",
+    "visualizer": {
+      "title": "Visualizador",
+      "colorMode": "Modo de color",
+      "color": "Color",
+      "auroraSpeed": "Velocidad de aurora",
+      "auroraBeatMode": "Aurora por compás",
+      "reactivity": "Reactividad",
+      "colorModeOptions": { "fixed": "Fijo", "aurora": "Aurora" },
+      "reactivityHint": "Los valores altos hacen que el visualizador reaccione más rápido."
+    }
   },
   "errors": {
     "NETWORK_TIMEOUT": "Tiempo de espera agotado. Verifica tu conexión.",

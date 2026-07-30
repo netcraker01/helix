@@ -49,6 +49,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { extractErrorMessage } from '@shared/utils/errors';
 import type { Track, FrequencyData } from '@shared/types/models';
 import { Source } from '@shared/types/models';
+import { reactivityToSmoothing, visualizerReactivity } from './visualizerSettings';
 
 /** The underlying HTMLAudio element for remote playback. */
 let audioEl: HTMLAudioElement | null = null;
@@ -80,6 +81,7 @@ let mediaSource: MediaElementAudioSourceNode | null = null;
 let gainNode: GainNode | null = null;
 /** Analyser node used for frequency-bin extraction. */
 let analyser: AnalyserNode | null = null;
+let stopAnalyserReactivity: (() => void) | null = null;
 /** rAF id for the remote FFT loop (null when not running). */
 let fftRafId: number | null = null;
 /** Reusable byte buffer for analyser.getByteFrequencyData (Uint8Array bins).
@@ -158,7 +160,10 @@ function ensureWebAudioChain(el: HTMLAudioElement): void {
   gainNode.gain.value = Math.max(0, Math.min(1, get(volume) / 100));
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = REMOTE_FFT_SIZE;
-  analyser.smoothingTimeConstant = 0.8;
+  stopAnalyserReactivity?.();
+  stopAnalyserReactivity = visualizerReactivity.subscribe((reactivity) => {
+    if (analyser) analyser.smoothingTimeConstant = reactivityToSmoothing(reactivity);
+  });
   mediaSource.connect(gainNode);
   gainNode.connect(analyser);
   analyser.connect(audioCtx.destination);

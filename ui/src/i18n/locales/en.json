@@ -130,7 +130,17 @@
     "diagnostics_error_rate": "Observed error rate",
     "diagnostics_unavailable": "Diagnostics are temporarily unavailable.",
     "diagnostics_refresh": "Refresh diagnostics",
-    "diagnostics_refreshing": "Refreshing…"
+    "diagnostics_refreshing": "Refreshing…",
+    "visualizer": {
+      "title": "Visualizer",
+      "colorMode": "Color mode",
+      "color": "Color",
+      "auroraSpeed": "Aurora speed",
+      "auroraBeatMode": "Beat-triggered aurora",
+      "reactivity": "Reactivity",
+      "colorModeOptions": { "fixed": "Fixed", "aurora": "Aurora" },
+      "reactivityHint": "Higher values make the visualizer react faster."
+    }
   },
   "errors": {
     "NETWORK_TIMEOUT": "Connection timed out. Check your network.",
