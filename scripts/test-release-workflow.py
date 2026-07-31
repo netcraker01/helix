@@ -44,6 +44,7 @@ require(release, "contents: write", "release.yml promotion write permission")
 require(release, "environment: release", "release.yml protected promotion environment")
 require(release, "validate-release-assets:", "release.yml read-only validation job")
 require(release, "jellyx-release-manifest", "release.yml content-addressed artifact manifest")
+require(release, "release-provenance.json", "release.yml immutable build provenance artifact")
 require(release, "sha256sum -c release-manifest/release-manifest.sha256", "release.yml promotion manifest revalidation")
 require(release, "! -name 'release-manifest.sha256'", "release.yml internal manifest exclusion")
 if release.count("contents: write") != 1:
@@ -178,14 +179,20 @@ if len(public_names) != len(expected_assets) * 2:
 if set(public_names) != set(expected_assets) | {f"{asset}.sha256" for asset in expected_assets}:
     raise SystemExit("release artifact layout has an incorrect public exact set")
 
-# Every release is authorized from the current protected main head. Dispatch
-# deliberately exposes no arbitrary SHA or tag input.
+# Every release is authorized from the current protected main head. Manual
+# staging additionally requires the caller to restate the exact SHA/version.
 require(release, "workflow_dispatch:", "release.yml manual trigger")
-if "target_commit:" in release or "release_tag:" in release.split("authorize-release:", 1)[0]:
-    raise SystemExit("release.yml: dispatch must not accept an arbitrary target or tag")
+require(release, "mode:", "release.yml manual release mode")
+require(release, "default: build-only", "release.yml safe manual default")
+require(release, "target_sha:", "release.yml exact manual target")
+require(release, "version:", "release.yml exact manual version")
+require(release, "ref: ${{ github.event_name == 'push' && github.sha || inputs.target_sha }}", "release.yml exact target checkout")
 require(release, "authorize-release:", "release.yml protected-main authorization job")
 require(release, 'main_sha="$(gh api', "release.yml current main SHA query")
 require(release, 'test "$candidate_sha" = "$main_sha"', "release.yml main SHA equality")
+require(release, '[[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]', "release.yml full SHA validation")
+require(release, 'test "$REQUESTED_SHA" = "$candidate_sha"', "release.yml requested SHA equality")
+require(release, 'test "$REQUESTED_VERSION" = "$version"', "release.yml requested version equality")
 require(release, 'commits/${candidate_sha}/check-runs', "release.yml exact-SHA check runs")
 require(release, 'required_context="Validate candidate"', "release.yml hardcoded required check name")
 require(release, "checks: read", "release.yml authorize-release check-runs API permission")
@@ -221,6 +228,9 @@ for tag_ref in (
 require(release, 'gh release create "$release_tag" --repo "${GITHUB_REPOSITORY}" --draft --target "$BUILT_SHA"', "release.yml draft target")
 require(release, 'test "$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq \'.object.sha\')" = "$BUILT_SHA"', "release.yml immediate remote-head recheck")
 stage = release.split("stage-and-publish-release:", 1)[1]
+require(stage, "if: ${{ needs.authorize-release.outputs.mode == 'publish' }}", "release.yml explicit publish mode gate")
+require(stage, "environment: release", "release.yml publish approval gate")
+require(stage, "release-provenance.json", "release.yml promotion provenance validation")
 if "actions/checkout" in stage or "git push" in stage or "./scripts/" in stage:
     raise SystemExit("release.yml: write-token promotion must not checkout or execute repository scripts")
 if "actions/download-artifact@v4" in stage:
