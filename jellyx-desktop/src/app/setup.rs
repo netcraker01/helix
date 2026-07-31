@@ -164,17 +164,6 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if window.label() != "main"
-                || !matches!(event, tauri::WindowEvent::CloseRequested { .. })
-            {
-                return;
-            }
-            let state = window.state::<AppState>();
-            if let Err(error) = state.focus.close_active() {
-                eprintln!("warn: failed to close active Focus session: {error}");
-            }
-        })
         .invoke_handler(tauri::generate_handler![
             crate::ipc::commands::play,
             crate::ipc::commands::play_local,

@@ -464,20 +464,6 @@ impl<C: Clock> FocusService<C> {
         Ok(Some(session))
     }
 
-    /// Complete a nonterminal session before the native window closes.
-    pub fn close_active(&self) -> Result<Option<FocusSession>, FocusServiceError> {
-        let Some(session) = self
-            .db
-            .focus_get_nonterminal_session()
-            .map_err(persistence)?
-        else {
-            return Ok(None);
-        };
-        let request_id = format!("native-close-{}-{}", session.id, session.revision);
-        self.end(&request_id, &session.id, session.revision)
-            .map(Some)
-    }
-
     /// Return recent completed/discarded sessions for history view.
     pub fn list_sessions(&self, limit: u32) -> Result<Vec<FocusSession>, FocusServiceError> {
         self.db.focus_list_sessions(limit).map_err(persistence)
@@ -884,16 +870,16 @@ mod tests {
         }
     }
     #[test]
-    fn native_close_completes_an_active_session_once() {
+    fn active_session_remains_recoverable_without_an_explicit_terminal_action() {
         let (service, _) = service(0);
         let started = start(&service);
 
-        let closed = service.close_active().unwrap().unwrap();
+        let recovered = service.recover().unwrap().unwrap();
 
-        assert_eq!(closed.id, started.id);
-        assert_eq!(closed.state, FocusSessionState::Completed);
-        assert_eq!(closed.outcome, Some(FocusOutcome::Completed));
-        assert_eq!(service.close_active().unwrap(), None);
+        assert_eq!(recovered.id, started.id);
+        assert_eq!(recovered.state, FocusSessionState::RunningWork);
+        assert_eq!(recovered.outcome, None);
+        assert!(service.list_sessions(10).unwrap().is_empty());
     }
     #[test]
     fn duplicate_request_replays_original_mutation() {
