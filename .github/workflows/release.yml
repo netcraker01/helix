@@ -2,8 +2,9 @@
 # Jellyx Player — Release Pipeline (Linux, Windows, and macOS)
 # =============================================================================
 # Builds Linux (AppImage, .deb, .rpm) and Windows (MSI, NSIS, portable exe)
-# on a v* tag push. Assets remain workflow artifacts until every platform has
-# passed; only the final promotion job creates and publishes the release.
+# on a v* tag push or an explicitly authorized manual target. Assets remain
+# workflow artifacts until every platform has passed; only the final promotion
+# job can create and publish the release.
 #
 # macOS DMGs are built through the reusable macOS workflow and join the same
 # final promotion gate.
@@ -40,8 +41,23 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    # Manual releases are always pinned to the current protected main head.
-    # Arbitrary commits and tag names are intentionally not accepted.
+    inputs:
+      mode:
+        description: Build only, or publish after release-environment approval
+        required: true
+        type: choice
+        options:
+          - build-only
+          - publish
+        default: build-only
+      target_sha:
+        description: Exact 40-character SHA of the current protected main head
+        required: true
+        type: string
+      version:
+        description: Exact Cargo package version at target_sha (for example, 0.4.3)
+        required: true
+        type: string
 
 # Build jobs run untrusted dependency and build code with read-only tokens.
 permissions:
@@ -62,11 +78,12 @@ jobs:
       sha: ${{ steps.authorize.outputs.sha }}
       tag: ${{ steps.authorize.outputs.tag }}
       version: ${{ steps.authorize.outputs.version }}
+      mode: ${{ steps.authorize.outputs.mode }}
     steps:
       - name: Checkout candidate without credentials
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.target_sha }}
           persist-credentials: false
           fetch-depth: 0
       - name: Fail closed unless the candidate is protected current main
@@ -74,6 +91,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           JELLYX_SENTRY_DSN: ${{ secrets.JELLYX_SENTRY_DSN }}
+          REQUESTED_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'publish' }}
+          REQUESTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.sha }}
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -84,6 +104,13 @@ jobs:
           version="$(grep '^version' jellyx-desktop/Cargo.toml | head -1 | cut -d'"' -f2)"
           test -n "$version"
           tag="v${version}"
+          mode="$REQUESTED_MODE"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "target_sha must be an exact 40-character commit SHA" >&2; exit 1; }
+            test "$REQUESTED_SHA" = "$candidate_sha" || { echo "checked out commit differs from requested target_sha" >&2; exit 1; }
+            test "$REQUESTED_VERSION" = "$version" || { echo "requested version differs from Cargo-derived version $version" >&2; exit 1; }
+            case "$mode" in build-only|publish) ;; *) echo "unsupported release mode: $mode" >&2; exit 1 ;; esac
+          fi
           # JELLYX_SENTRY_DSN is optional. When absent or empty, builds
           # proceed without any DSN embedded and telemetry stays completely
           # off. When present, the ephemeral DSN embedding pipeline activates
@@ -112,6 +139,7 @@ jobs:
           echo "sha=$candidate_sha" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Linux: AppImage + .deb + .rpm
@@ -838,6 +866,9 @@ jobs:
           path: release-body
       - name: Validate assets and generate content-addressed manifest
         env:
+          RELEASE_MODE: ${{ needs.authorize-release.outputs.mode }}
+          RELEASE_SHA: ${{ needs.authorize-release.outputs.sha }}
+          RELEASE_TAG: ${{ needs.authorize-release.outputs.tag }}
           RELEASE_VERSION: ${{ needs.authorize-release.outputs.version }}
         shell: bash
         run: |
@@ -900,17 +931,30 @@ jobs:
               exit 1
             fi
           done
-          sha256sum "${assets[@]}" release-body/release-body.md > release-manifest.sha256
-      - name: Upload validated content manifest
+          mkdir -p release-manifest
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$RELEASE_SHA" \
+            --arg tag "$RELEASE_TAG" \
+            --arg version "$RELEASE_VERSION" \
+            --arg mode "$RELEASE_MODE" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{repository: $repository, sha: $sha, tag: $tag, version: $version, mode: $mode, run_id: $run_id, run_attempt: $run_attempt}' \
+            > release-manifest/release-provenance.json
+          sha256sum "${assets[@]}" release-body/release-body.md release-manifest/release-provenance.json \
+            > release-manifest/release-manifest.sha256
+      - name: Upload validated content manifest and provenance
         uses: actions/upload-artifact@v4
         with:
           name: jellyx-release-manifest
-          path: release-manifest.sha256
+          path: release-manifest/
           if-no-files-found: error
           retention-days: 30
 
   stage-and-publish-release:
     name: Stage, validate, and publish release
+    if: ${{ needs.authorize-release.outputs.mode == 'publish' }}
     runs-on: ubuntu-22.04
     needs:
       - build-linux
@@ -973,6 +1017,9 @@ jobs:
           test "$release_tag" = "v${version}" || { echo "authorization tag/version mismatch" >&2; exit 1; }
           test -f release-body/release-body.md
           test -f release-manifest/release-manifest.sha256
+          test "$(jq -r '.sha' release-manifest/release-provenance.json)" = "$BUILT_SHA"
+          test "$(jq -r '.version' release-manifest/release-provenance.json)" = "$version"
+          test "$(jq -r '.mode' release-manifest/release-provenance.json)" = publish
           # --- Revalidate read-only validator output before write-token use ---
           # The read-only validator emitted this manifest after checking the
           # exact asset set and every sidecar checksum. Recheck all content
