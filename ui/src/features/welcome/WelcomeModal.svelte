@@ -12,7 +12,7 @@
   import { X, Star, ExternalLink, Heart } from 'lucide-svelte';
   import { JELLYX_REPO_URL, JELLYX_STARGAZERS_URL } from '@shared/constants';
   import { getTelemetrySettings, setTelemetryEnabled, openExternalUrl } from '@services/commands';
-  import logoWide from '@shared/assets/jellyx/logo-wide.svg';
+  import logoWide from '@shared/assets/jellyx/logo-wide.png';
 
   $: open = $welcomeStore.modalOpen;
   $: version = $welcomeStore.version;
