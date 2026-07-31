@@ -14,6 +14,7 @@ import FolderDetail from '../routes/Library/FolderDetail.svelte';
 import Settings from '../routes/Settings/Page.svelte';
 import ArtistPage from '../routes/Artist/Page.svelte';
 import AlbumPage from '../routes/Album/Page.svelte';
+import FocusPage from '../routes/Focus/Page.svelte';
 import MiniPlayer from '@features/mini-player/MiniPlayer.svelte';
 import Visualizer from '@features/player/components/Visualizer.svelte';
 import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from '@features/player/stores/player';
@@ -53,7 +54,8 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
     | { name: 'settings' }
     | { name: 'mini-player' }
     | { name: 'artist'; id: string }
-    | { name: 'album'; id: string };
+    | { name: 'album'; id: string }
+    | { name: 'focus' };
 
   function resolveRoute(path: string): RouteMatch {
     if (path === '/search') return { name: 'search' };
@@ -66,6 +68,7 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
     if (path.startsWith('/playlists/')) return { name: 'playlist-detail', id: decodeURIComponent(path.slice('/playlists/'.length)) };
     if (path.startsWith('/artist/')) return { name: 'artist', id: decodeURIComponent(path.slice('/artist/'.length)) };
     if (path.startsWith('/album/')) return { name: 'album', id: decodeURIComponent(path.slice('/album/'.length)) };
+    if (path === '/focus') return { name: 'focus' };
     return { name: 'home' };
   }
 
@@ -116,6 +119,8 @@ import { frequencyData, cinematicMode, cinematicIntensity, modoCineActive } from
       <ArtistPage id={route.id} />
     {:else if route.name === 'album'}
       <AlbumPage id={route.id} />
+    {:else if route.name === 'focus'}
+      <FocusPage />
     {:else}
       <Home />
     {/if}

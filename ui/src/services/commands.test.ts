@@ -11,6 +11,8 @@ import {
   playAlbum,
   playStream,
   isLatestStreamRequest,
+  resolveTrack,
+  addTrackToPlaylist,
 } from '@services/commands';
 
 const mocks = vi.hoisted(() => ({
@@ -148,6 +150,30 @@ describe('Grouped search commands', () => {
     expect(secondId).toBeGreaterThan(firstId);
     expect(isLatestStreamRequest(firstId)).toBe(false);
     expect(isLatestStreamRequest(secondId)).toBe(true);
+  });
+
+  it('resolves a source track without starting playback', async () => {
+    const track = { id: 'yt-1', source: 'YouTube', sourceId: 'dQw4w9WgXcQ' } as any;
+    mocks.invokeCommand.mockResolvedValueOnce(track);
+
+    await expect(resolveTrack('YouTube', 'dQw4w9WgXcQ')).resolves.toBe(track);
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('resolve_track', {
+      source: 'YouTube',
+      id: 'dQw4w9WgXcQ',
+    });
+  });
+
+  it('adds the resolved track to the selected playlist', async () => {
+    const track = { id: 'yt-1', source: 'YouTube', sourceId: 'dQw4w9WgXcQ' } as any;
+    mocks.invokeCommand.mockResolvedValueOnce(undefined);
+
+    await addTrackToPlaylist('playlist-1', track);
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('add_track_to_playlist', {
+      playlistId: 'playlist-1',
+      track,
+    });
   });
 
   it('openMiniPlayer invokes open_mini_player', async () => {

@@ -36,6 +36,30 @@ Muchos abrimos YouTube solo para escuchar sesiones largas de ambient, focus, lof
 
 Jellyx existe exactamente para ese flujo. Se centra en el audio: YouTube, SoundCloud y archivos locales en una app nativa de escritorio, sin cuentas, sin suscripciones y sin reproducción de vídeo innecesaria.
 
+<a id="novedades-v043"></a>
+
+## Novedades de v0.4.3
+
+### Sesiones Focus y Pomodoro
+
+Convierte una sesión de música en un bloque de trabajo consciente. Crea una sesión Focus con intención, objetivo y primera acción; después decide si mantienes la música actual, usas un preset o buscas algo nuevo.
+
+- **Pomodoro:** cuatro bloques de trabajo de 25 minutos con descansos de 5 minutos.
+- **Trabajo profundo:** dos bloques de 90 minutos con descansos de 15 minutos.
+- **Focus rápido:** un bloque de 15 minutos.
+- Pausa, reanuda, salta fases, captura notas rápidas o distracciones, revisa sesiones terminadas y recupera una sesión sin terminar tras reiniciar la app.
+
+### Flujo de listas
+
+- Añade un track de una lista al final de la cola o colócalo justo después del actual con **Reproducir siguiente**.
+- Importa un track de YouTube en una lista pegando su URL o arrastrando un enlace del navegador sobre la lista.
+
+### Reproductor y visualizadores
+
+- Visualizadores más fiables y ajustables en Linux y WebKitGTK.
+- Las barras vacías ya no ocupan espacio visual; las barras activas aprovechan todo el ancho disponible.
+- Vista de artwork más ancha en Reproduciendo y panel de cola plegable.
+
 <a id="por-que-existe-jellyx"></a>
 
 ## Por Qué Existe Jellyx
