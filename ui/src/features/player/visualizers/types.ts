@@ -7,6 +7,7 @@
  * test with a stub 2D context.
  */
 import type { FrequencyData } from '@shared/types/models';
+import type { SpectrumAnalysis } from './analyzeSpectrum';
 
 /** Theme tokens resolved from CSS custom properties by the host. */
 export interface VisualizerTheme {
@@ -16,6 +17,10 @@ export interface VisualizerTheme {
   barGap: number;
   /** Minimum bar height in pixels (CSS var `--viz-bar-min-height`). */
   barMinHeight: number;
+  /** Optional engine palette; hosts from issue #33 may provide it later. */
+  palette?: readonly [string, string?];
+  /** Interpolation speed multiplier. */
+  reactivity?: number;
 }
 
 /** Signature every renderer must implement. */
@@ -24,5 +29,6 @@ export type VisualizerRenderer = (
   width: number,
   height: number,
   data: FrequencyData | null,
-  theme: VisualizerTheme
+  theme: VisualizerTheme,
+  analysis?: SpectrumAnalysis
 ) => void;

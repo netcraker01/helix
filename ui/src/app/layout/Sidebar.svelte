@@ -1,7 +1,7 @@
 <script lang="ts">
   import BrandLockup from './BrandLockup.svelte';
   import { sidebarCollapsed } from './sidebar';
-  import { Home, Search, ListMusic, Music, Library, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-svelte';
+  import { Home, Search, ListMusic, Music, Library, Target, Settings, PanelLeftClose, PanelLeftOpen } from 'lucide-svelte';
   import { t } from '@i18n';
   import { currentPath, navigate } from '../router/navigation';
 
@@ -30,6 +30,10 @@
     <button type="button" class="nav-link{$currentPath === '/library' ? ' active' : ''}" on:click={() => navigate('/library')}>
       <Library size={iconSize} />
       <span>{$t('routes.library')}</span>
+    </button>
+    <button type="button" class="nav-link{$currentPath === '/focus' ? ' active' : ''}" on:click={() => navigate('/focus')}>
+      <Target size={iconSize} />
+      <span>{$t('routes.focus')}</span>
     </button>
     <button type="button" class="nav-link{$currentPath === '/settings' ? ' active' : ''}" on:click={() => navigate('/settings')}>
       <Settings size={iconSize} />

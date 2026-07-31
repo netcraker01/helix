@@ -37,6 +37,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build-windows:
@@ -60,13 +61,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}-v2
-
-      - name: Cache Cargo build
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-v2
 
       - name: Install Node.js
         uses: actions/setup-node@v4

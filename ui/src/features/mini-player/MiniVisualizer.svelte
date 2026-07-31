@@ -9,6 +9,10 @@
   import { frequencyData, currentTrack } from '@features/player/stores/player';
   import { renderBars } from '@features/player/visualizers/bars';
   import { limitFrequencyRange, createActiveRange, type ActiveRangeState } from '@features/player/visualizers/activeRange';
+  import { createSpectrumAnalyzer } from '@features/player/visualizers/analyzeSpectrum';
+  import { createFrameInterpolator } from '@features/player/visualizers/frameInterpolation';
+  import { getCanvasContext } from '@features/player/visualizers/runtime';
+  import { visualizerReactivity } from '@features/player/stores/visualizerSettings';
   import type { VisualizerTheme } from '@features/player/visualizers/types';
   import type { FrequencyData } from '@shared/types/models';
 
@@ -16,28 +20,27 @@
   let rafId: number | null = null;
 
   const activeRange: ActiveRangeState = createActiveRange();
+  const analyze = createSpectrumAnalyzer();
+  const interpolate = createFrameInterpolator(0.5);
 
   // Local reference to frequency data for the rAF loop (avoids reactive churn
   // inside the animation frame — same pattern as the main Visualizer).
   let currentData: FrequencyData | null = null;
-  $: if ($frequencyData) currentData = $frequencyData;
+  $: currentData = $frequencyData;
 
   // Compact theme: thinner bars and tighter gaps suit the small canvas.
   const theme: VisualizerTheme = {
     accentColor: 'var(--skin-accent, #6366f1)',
     barGap: 1,
     barMinHeight: 1,
+    palette: ['#000000'],
   };
 
   let cachedCtx: CanvasRenderingContext2D | null = null;
 
   function getCtx(): CanvasRenderingContext2D | null {
     if (cachedCtx) return cachedCtx;
-    cachedCtx = canvas.getContext('2d', {
-      alpha: true, // mini viz floats over the skin, needs transparency
-      desynchronized: true,
-      willReadFrequently: false,
-    }) as CanvasRenderingContext2D | null;
+    cachedCtx = getCanvasContext(canvas, true);
     return cachedCtx;
   }
 
@@ -60,6 +63,7 @@
 
   function renderFrame(): void {
     if (!canvas) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (canvas.width === 0 || canvas.height === 0) {
       const parent = canvas.parentElement;
       if (parent) {
@@ -78,8 +82,11 @@
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const raw = currentData ?? { bins: new Float32Array(0), sampleRate: 44100, peak: 0 };
-    const data = limitFrequencyRange(activeRange, raw, $currentTrack?.id);
-    renderBars(ctx, canvas.width, canvas.height, data, theme);
+    const rangedData = limitFrequencyRange(activeRange, raw, $currentTrack?.id);
+    const data = interpolate(rangedData, $visualizerReactivity);
+    const analysis = analyze(data);
+    theme.reactivity = $visualizerReactivity;
+    renderBars(ctx, canvas.width, canvas.height, data, theme, analysis);
   }
 
   let ro: ResizeObserver | null = null;

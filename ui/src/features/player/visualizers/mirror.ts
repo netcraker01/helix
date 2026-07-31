@@ -8,6 +8,7 @@
  */
 import type { FrequencyData } from '@shared/types/models';
 import type { VisualizerTheme } from './types';
+import type { SpectrumAnalysis } from './analyzeSpectrum';
 
 /**
  * Render bars mirrored from the horizontal center.
@@ -23,7 +24,8 @@ export function renderMirror(
   width: number,
   height: number,
   data: FrequencyData | null,
-  theme: VisualizerTheme
+  theme: VisualizerTheme,
+  analysis?: SpectrumAnalysis
 ): void {
   if (!data || !data.bins.length) return;
 
@@ -32,12 +34,26 @@ export function renderMirror(
   const groupSize = Math.ceil(bins.length / maxBars);
   const barGap = theme.barGap;
   const barMinHeight = theme.barMinHeight;
-  const barWidth = Math.max(1, (width - barGap * (maxBars - 1)) / maxBars);
   const midY = height / 2;
 
-  ctx.fillStyle = theme.accentColor;
+  ctx.fillStyle = theme.palette?.[0] ?? theme.accentColor;
 
-  for (let i = 0; i < maxBars; i++) {
+  const activeGroups: number[] = [];
+  for (let index = 0; index < maxBars; index++) {
+    const start = index * groupSize;
+    const end = Math.min(start + groupSize, bins.length);
+    for (let bin = start; bin < end; bin++) {
+      if (bins[bin] > 0) {
+        activeGroups.push(index);
+        break;
+      }
+    }
+  }
+  if (!activeGroups.length) return;
+  const barWidth = Math.max(1, (width - barGap * (activeGroups.length - 1)) / activeGroups.length);
+
+  for (let drawIndex = 0; drawIndex < activeGroups.length; drawIndex++) {
+    const i = activeGroups[drawIndex];
     let sum = 0;
     let count = 0;
     const groupStart = i * groupSize;
@@ -47,11 +63,12 @@ export function renderMirror(
       count++;
     }
     const magnitude = count > 0 ? sum / count : 0;
-    const normalizedHeight = peak > 0 ? magnitude / peak : 0;
+    const normalizedHeight = peak > 0 ? Math.min(1, magnitude / peak) : 0;
     const shaped = Math.pow(normalizedHeight, 0.85);
-    const halfBar = Math.max(barMinHeight / 2, shaped * height * 0.45);
+    const punch = 1 + (analysis?.bass ?? 0) * 0.1 + (analysis?.beat ? 0.18 : 0);
+    const halfBar = Math.min(midY, Math.max(barMinHeight / 2, shaped * height * 0.45 * punch));
 
-    const x = i * (barWidth + barGap);
+    const x = drawIndex * (barWidth + barGap);
 
     ctx.globalAlpha = 0.5 + shaped * 0.5;
     // Upper half (grows upward from the center)
