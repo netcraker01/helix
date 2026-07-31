@@ -22,4 +22,12 @@ describe('release version', () => {
       expect(lock).toMatch(new RegExp(`name = "${crate}"\\r?\\nversion = "${version.replaceAll('.', '\\.')}"`));
     }
   });
+
+  it('leaves HTML5 drag and drop in control of browser DataTransfer payloads', () => {
+    const config = JSON.parse(
+      readFileSync(resolve(root, 'jellyx-desktop/tauri.conf.json'), 'utf8'),
+    );
+
+    expect(config.app.windows[0].dragDropEnabled).toBe(false);
+  });
 });

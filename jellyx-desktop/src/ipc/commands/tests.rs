@@ -4,6 +4,102 @@
 //! require a running Tauri runtime.
 
 use super::*;
+use std::sync::Arc;
+
+#[test]
+fn focus_command_errors_are_stable_and_redacted() {
+    let stale = focus_error(FocusServiceError::Persistence(
+        "stale focus revision; sqlite at /private/path".into(),
+    ));
+    let unavailable = focus_error(FocusServiceError::Persistence(
+        "database is locked at /private/path".into(),
+    ));
+
+    assert_eq!(stale.code, "FOCUS_REVISION_CONFLICT");
+    assert_eq!(unavailable.code, "FOCUS_UNAVAILABLE");
+    assert_eq!(
+        serde_json::to_string(&unavailable).unwrap(),
+        "{\"code\":\"FOCUS_UNAVAILABLE\",\"details\":null}"
+    );
+}
+
+#[test]
+fn focus_start_delegates_and_replays_request_ids() {
+    let service = FocusService::new(
+        Arc::new(crate::persistence::db::Database::open_in_memory().unwrap()),
+        crate::focus::service::SystemClock,
+    );
+    let cadence = FocusCadence {
+        work_duration_ms: 1_000,
+        break_duration_ms: 0,
+        rounds: 1,
+    };
+    let started = start_focus(
+        &service,
+        "focus-ipc-start",
+        0,
+        "Write command tests".into(),
+        "Ship recovery".into(),
+        "Open the editor".into(),
+        FocusWorkflow::Custom,
+        cadence.clone(),
+        FocusMusicStrategy::None,
+    )
+    .unwrap();
+    let replay = start_focus(
+        &service,
+        "focus-ipc-start",
+        0,
+        "Write command tests".into(),
+        "Ship recovery".into(),
+        "Open the editor".into(),
+        FocusWorkflow::Custom,
+        cadence,
+        FocusMusicStrategy::None,
+    )
+    .unwrap();
+
+    assert_eq!(replay, started);
+}
+
+#[test]
+fn focus_events_include_snapshot_phase_and_playback_directive() {
+    let service = FocusService::new(
+        Arc::new(crate::persistence::db::Database::open_in_memory().unwrap()),
+        crate::focus::service::SystemClock,
+    );
+    let result = start_focus(
+        &service,
+        "focus-event-start",
+        0,
+        "Test events".into(),
+        String::new(),
+        String::new(),
+        FocusWorkflow::Custom,
+        FocusCadence {
+            work_duration_ms: 1_000,
+            break_duration_ms: 0,
+            rounds: 1,
+        },
+        FocusMusicStrategy::ContinueCurrent,
+    )
+    .unwrap();
+    let mut events = Vec::new();
+    emit_focus_result(&result, true, |event| {
+        events.push(event.clone());
+        Ok(())
+    });
+
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, FocusEventKind::SessionMutation(_))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, FocusEventKind::PhaseChange { .. })));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, FocusEventKind::PlaybackDirective(_))));
+}
 
 #[test]
 fn source_contract_accepts_supported_source_names() {

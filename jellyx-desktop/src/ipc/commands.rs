@@ -17,6 +17,11 @@
 use std::sync::Arc;
 
 use crate::errors::types::{AppError, ValidationError};
+use crate::focus::models::{
+    FocusCadence, FocusCaptureKind, FocusEvent, FocusEventKind, FocusMusicStrategy,
+    FocusMutationResult, FocusPlaybackFailure, FocusPreferences, FocusSession, FocusWorkflow,
+};
+use crate::focus::service::{FocusService, FocusServiceError};
 use crate::ipc::dto::{
     AlbumDetail, ArtistDetail, ArtistFavorite as ArtistFavoriteDto, ArtistSummary,
     GroupedSearchResult, HomeSnapshot, PlaylistTrackEntry as PlaylistTrackEntryDto,
@@ -31,7 +36,42 @@ use crate::updater::service::UpdateService;
 
 use jellyx_core::models::playlist::Playlist;
 use jellyx_core::models::track::Track;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+
+const FOCUS_EVENT: &str = "focus-event";
+
+fn emit_focus_result<E>(result: &FocusMutationResult, phase_changed: bool, mut emit: E)
+where
+    E: FnMut(&FocusEvent) -> Result<(), String>,
+{
+    let snapshot = &result.snapshot;
+    let envelope = |kind| FocusEvent {
+        session_id: snapshot.id.clone(),
+        operation_id: result.operation_id.clone(),
+        revision: snapshot.revision,
+        kind,
+    };
+    let _ = emit(&envelope(FocusEventKind::SessionMutation(snapshot.clone())));
+    if phase_changed {
+        let _ = emit(&envelope(FocusEventKind::PhaseChange {
+            phase: snapshot.phase,
+            state: snapshot.state,
+        }));
+    }
+    if let Some(degradation) = snapshot.degradation.clone() {
+        let _ = emit(&envelope(FocusEventKind::Degraded(degradation)));
+    }
+    if let Some(directive) = result.playback_directive.clone() {
+        let _ = emit(&envelope(FocusEventKind::PlaybackDirective(directive)));
+    }
+}
+
+fn emit_focus_mutation(app: &tauri::AppHandle, result: &FocusMutationResult, phase_changed: bool) {
+    emit_focus_result(result, phase_changed, |event| {
+        app.emit(FOCUS_EVENT, event)
+            .map_err(|error| error.to_string())
+    });
+}
 
 fn parse_source(source: &str) -> Result<jellyx_core::models::source::Source, AppError> {
     serde_json::from_value(serde_json::Value::String(source.to_owned()))
@@ -54,6 +94,66 @@ pub struct AppState {
     pub scanner: Arc<ScannerService>,
     /// Channel-aware updater service (Phase 1: notify-only / open-release-page).
     pub updater: Arc<UpdateService>,
+    /// FocusService is the sole authority for Focus lifecycle and recovery.
+    pub focus: Arc<FocusService>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusCommandError {
+    pub code: &'static str,
+    pub details: Option<&'static str>,
+}
+
+fn focus_error(error: FocusServiceError) -> FocusCommandError {
+    match error {
+        FocusServiceError::NotFound => FocusCommandError {
+            code: "FOCUS_NOT_FOUND",
+            details: None,
+        },
+        FocusServiceError::InvalidTransition { .. } => FocusCommandError {
+            code: "FOCUS_INVALID_TRANSITION",
+            details: None,
+        },
+        FocusServiceError::Persistence(message) if message.contains("stale") => FocusCommandError {
+            code: "FOCUS_REVISION_CONFLICT",
+            details: None,
+        },
+        FocusServiceError::Persistence(_) => FocusCommandError {
+            code: "FOCUS_UNAVAILABLE",
+            details: None,
+        },
+    }
+}
+
+fn start_focus(
+    service: &FocusService,
+    request_id: &str,
+    expected_revision: i64,
+    intention: String,
+    goal: String,
+    first_action: String,
+    workflow: FocusWorkflow,
+    cadence: FocusCadence,
+    music_strategy: FocusMusicStrategy,
+) -> Result<FocusMutationResult, FocusCommandError> {
+    if expected_revision != 0 {
+        return Err(FocusCommandError {
+            code: "FOCUS_REVISION_CONFLICT",
+            details: None,
+        });
+    }
+    service
+        .start_with_playback(
+            request_id,
+            intention,
+            goal,
+            first_action,
+            workflow,
+            cadence,
+            music_strategy,
+        )
+        .map_err(focus_error)
 }
 
 /// Convert a persistence-layer `UserPlaylist` into its IPC DTO form.
@@ -72,8 +172,192 @@ fn playlist_to_dto(pl: crate::persistence::models::UserPlaylist) -> UserPlaylist
 // ── Synchronous commands (fast, in-memory or SQLite) ──────────────────
 
 #[tauri::command]
+pub fn start_focus_session(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    expected_revision: i64,
+    intention: String,
+    goal: String,
+    first_action: String,
+    workflow: FocusWorkflow,
+    cadence: FocusCadence,
+    music_strategy: FocusMusicStrategy,
+) -> Result<FocusMutationResult, FocusCommandError> {
+    let result = start_focus(
+        &state.focus,
+        &request_id,
+        expected_revision,
+        intention,
+        goal,
+        first_action,
+        workflow,
+        cadence,
+        music_strategy,
+    )?;
+    emit_focus_mutation(&app, &result, true);
+    Ok(result)
+}
+
+macro_rules! focus_lifecycle_command {
+    ($name:ident, $method:ident) => {
+        #[tauri::command]
+        pub fn $name(
+            state: tauri::State<AppState>,
+            app: tauri::AppHandle,
+            request_id: String,
+            id: String,
+            expected_revision: i64,
+        ) -> Result<FocusMutationResult, FocusCommandError> {
+            let result = state
+                .focus
+                .$method(&request_id, &id, expected_revision)
+                .map_err(focus_error)?;
+            emit_focus_mutation(&app, &result, true);
+            Ok(result)
+        }
+    };
+}
+
+focus_lifecycle_command!(pause_focus, pause_with_playback);
+focus_lifecycle_command!(resume_focus, resume_with_playback);
+focus_lifecycle_command!(skip_focus, skip_with_playback);
+focus_lifecycle_command!(end_focus, end_with_playback);
+focus_lifecycle_command!(discard_focus, discard_with_playback);
+
+#[tauri::command]
+pub fn degrade_focus_playback(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    failure: FocusPlaybackFailure,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .degrade_playback(&request_id, &id, expected_revision, failure)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn ack_focus_playback(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    directive_id: String,
+    failure: Option<FocusPlaybackFailure>,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .acknowledge_playback(&request_id, &id, expected_revision, &directive_id, failure)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn capture_focus_item(
+    state: tauri::State<AppState>,
+    app: tauri::AppHandle,
+    request_id: String,
+    id: String,
+    expected_revision: i64,
+    kind: FocusCaptureKind,
+    body: String,
+) -> Result<FocusSession, FocusCommandError> {
+    let snapshot = state
+        .focus
+        .capture(&request_id, &id, expected_revision, kind, body)
+        .map_err(focus_error)?;
+    emit_focus_mutation(
+        &app,
+        &FocusMutationResult {
+            operation_id: request_id,
+            snapshot: snapshot.clone(),
+            playback_directive: None,
+        },
+        false,
+    );
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn recover_focus(
+    state: tauri::State<AppState>,
+) -> Result<Option<FocusSession>, FocusCommandError> {
+    state.focus.recover().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn get_active_focus(
+    state: tauri::State<AppState>,
+) -> Result<Option<FocusSession>, FocusCommandError> {
+    state.focus.recover().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn list_focus_sessions(
+    state: tauri::State<AppState>,
+    limit: u32,
+) -> Result<Vec<FocusSession>, FocusCommandError> {
+    state.focus.list_sessions(limit).map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn delete_focus_session(
+    state: tauri::State<AppState>,
+    id: String,
+) -> Result<(), FocusCommandError> {
+    state.focus.delete_session(&id).map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn get_focus_preferences(
+    state: tauri::State<AppState>,
+) -> Result<FocusPreferences, FocusCommandError> {
+    state.focus.preferences().map_err(focus_error)
+}
+
+#[tauri::command]
+pub fn set_focus_preferences(
+    state: tauri::State<AppState>,
+    preferences: FocusPreferences,
+) -> Result<FocusPreferences, FocusCommandError> {
+    state
+        .focus
+        .set_preferences(preferences)
+        .map_err(focus_error)
+}
+
+#[tauri::command]
 pub fn play(state: tauri::State<AppState>, url: &str) -> Result<(), AppError> {
     state.playback.play(url)
+}
+
+#[tauri::command]
+pub fn stop(state: tauri::State<AppState>) -> Result<(), AppError> {
+    state.playback.stop()
 }
 
 #[tauri::command]

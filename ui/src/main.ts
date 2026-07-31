@@ -17,6 +17,7 @@ import { checkWelcome } from '@features/welcome/welcomeStore';
 import { mount } from 'svelte';
 import App from './app/App.svelte';
 import { getMigratedItem } from '@shared/utils/storage';
+import { initFocusRuntime } from '@features/focus/runtime';
 
 // Global styles
 import './styles/global.css';
@@ -35,6 +36,7 @@ function restoreDecorations(): void {
 async function bootstrap() {
   try {
     await initI18n();
+    await initFocusRuntime();
     mount(App, {
       target: document.getElementById('app')!,
     });

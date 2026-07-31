@@ -199,7 +199,7 @@
     dragOver = false;
     if (!event.dataTransfer) return;
 
-    const input = extractDroppedSourceInput(event.dataTransfer);
+    const input = await extractDroppedSourceInput(event.dataTransfer);
     if (input) {
       await importYouTubeTrack(input);
     } else {

@@ -641,6 +641,13 @@ export function resumeRemote(): void {
   }
 }
 
+/** Resume remote playback while exposing failure to application-level callers. */
+export async function resumeRemoteOrThrow(): Promise<void> {
+  if (!audioEl || !audioEl.src) throw new Error('No remote playback pipeline');
+  resumeAudioCtx();
+  await audioEl.play();
+}
+
 /** Seek to a position in seconds.
  *
  * Both YouTube and SoundCloud use native `audio.currentTime = position`. The
