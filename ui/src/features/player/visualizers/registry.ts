@@ -72,6 +72,11 @@ export const VISUALIZER_MODES: readonly VisualizerModeEntry[] = [
 /** Default mode when no persisted preference exists or the stored one is unknown. */
 export const DEFAULT_VISUALIZER_MODE: VisualizerModeId = VisualizerMode.Bars;
 
+/** Validate persisted or external values against the registry's stable ids. */
+export function isVisualizerModeId(id: string): id is VisualizerModeId {
+  return VISUALIZER_MODES.some((mode) => mode.id === id);
+}
+
 /**
  * Resolve a persisted mode id to a registry entry, falling back to the
  * default mode if the id is unknown. Keeps the persisted store small and

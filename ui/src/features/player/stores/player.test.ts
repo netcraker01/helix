@@ -156,6 +156,30 @@ describe('player event bootstrap FFT ownership', () => {
     mocks.isLatestStreamRequest.mockReturnValue(true);
   }
 
+  it('registers local FFT independently of player event initialization', async () => {
+    prepareBootstrapMocks();
+    let onFrame: ((data: FrequencyData) => void) | undefined;
+    mocks.onFftFrame.mockImplementation(async (callback) => {
+      onFrame = callback;
+      return vi.fn();
+    });
+    const { frequencyData, initLocalFft } = await import('./player');
+
+    await Promise.all([initLocalFft(), initLocalFft()]);
+    onFrame?.({ bins: new Float32Array([0.25, 0.5]), sampleRate: 48_000, peak: 0.5 });
+
+    const values: FrequencyData[] = [];
+    const unsubscribe = frequencyData.subscribe((frame) => {
+      if (frame) values.push(frame);
+    });
+    const value = values.at(-1);
+    expect(mocks.onFftFrame).toHaveBeenCalledTimes(1);
+    expect(value?.sampleRate).toBe(48_000);
+    expect(Array.from(value?.bins ?? [])).toEqual([0.25, 0.5]);
+    expect(mocks.onTrackChanged).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
   it('starts one local listener at bootstrap, publishes frames without a visualizer, and gates stale sources', async () => {
     vi.resetModules();
     vi.clearAllMocks();
@@ -231,7 +255,7 @@ describe('player event bootstrap FFT ownership', () => {
     expect(mocks.onTrackChanged).toHaveBeenCalledTimes(1);
   });
 
-  it('cleans partial setup before retrying so listeners are not duplicated', async () => {
+  it('keeps the application-owned FFT listener when later setup fails', async () => {
     prepareBootstrapMocks();
     const stopListener = vi.fn();
     const stopTrackChanged = vi.fn();
@@ -243,9 +267,9 @@ describe('player event bootstrap FFT ownership', () => {
     await expect(initPlayerEvents()).rejects.toThrow('state listener unavailable');
     await initPlayerEvents();
 
-    expect(stopListener).toHaveBeenCalledTimes(1);
+    expect(stopListener).not.toHaveBeenCalled();
     expect(stopTrackChanged).toHaveBeenCalledTimes(1);
-    expect(mocks.onFftFrame).toHaveBeenCalledTimes(2);
+    expect(mocks.onFftFrame).toHaveBeenCalledTimes(1);
     expect(mocks.onTrackChanged).toHaveBeenCalledTimes(2);
     expect(mocks.onStateChanged).toHaveBeenCalledTimes(2);
   });

@@ -15,6 +15,7 @@ import {
   loadRemoteStream,
   pauseRemote,
   resumeRemote,
+  resumeRemoteOrThrow,
   resumeRemoteAudioCtx,
   seekRemote,
   stopRemote,
@@ -22,6 +23,7 @@ import {
 } from './remotePlayer';
 import {
   DEFAULT_VISUALIZER_MODE,
+  isVisualizerModeId,
   type VisualizerModeId,
 } from '../visualizers/registry';
 
@@ -124,6 +126,10 @@ let rollingPeak = 0;
 
 export function publishFftFrame(source: FftSource, data: FrequencyData): void {
   if (activeFftSource !== source) return;
+  if (!Number.isFinite(data.sampleRate) || data.sampleRate <= 0
+    || !Number.isFinite(data.peak) || data.peak < 0) {
+    throw new TypeError('Invalid FFT frame metadata');
+  }
 
   // Rise instantly, decay slowly.
   if (data.peak > rollingPeak) {
@@ -164,11 +170,7 @@ const VISUALIZER_MODE_SUFFIX = 'visualizer-mode';
 function readPersistedVisualizerMode(): VisualizerModeId {
   const raw = getMigratedItem(VISUALIZER_MODE_SUFFIX);
   if (raw == null) return DEFAULT_VISUALIZER_MODE;
-  // Validate against the registry's known ids; ignore anything else.
-  // (We import the mode set lazily to avoid a circular import with the
-  //  registry importing renderers that import types only.)
-  const known: VisualizerModeId[] = ['bars', 'wave', 'mirror'];
-  return (known as readonly string[]).includes(raw) ? (raw as VisualizerModeId) : DEFAULT_VISUALIZER_MODE;
+  return isVisualizerModeId(raw) ? raw : DEFAULT_VISUALIZER_MODE;
 }
 
 /** Currently selected visualizer mode id (persisted to localStorage).
@@ -260,6 +262,30 @@ export function setCinematicIntensity(value: number): void {
 
 let initialized = false;
 let playerEventsStarting: Promise<void> | null = null;
+let focusRemoteStart: {
+  trackId: string;
+  position: number | null;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+} | null = null;
+
+function settleFocusRemoteStart(trackId: string, error?: Error): void {
+  if (focusRemoteStart?.trackId !== trackId) return;
+  clearTimeout(focusRemoteStart.timeout);
+  const waiter = focusRemoteStart;
+  focusRemoteStart = null;
+  if (error) waiter.reject(error);
+  else waiter.resolve();
+}
+
+function cancelFocusRemoteStart(): void {
+  if (!focusRemoteStart) return;
+  clearTimeout(focusRemoteStart.timeout);
+  const waiter = focusRemoteStart;
+  focusRemoteStart = null;
+  waiter.reject(new Error('Remote Focus playback was superseded'));
+}
 let fftListenerUnlisten: (() => void) | null = null;
 let fftListenerStarting: Promise<void> | null = null;
 
@@ -283,10 +309,15 @@ async function ensureLocalFftListener(): Promise<void> {
   return fftListenerStarting;
 }
 
+/** Register the local FFT consumer independently of player UI/runtime setup. */
+export async function initLocalFft(): Promise<void> {
+  await ensureLocalFftListener();
+}
+
 /** Prepare the local FFT event listener for a new playback. */
 export async function prepareLocalFft(): Promise<void> {
   selectFftSource('local');
-  await ensureLocalFftListener();
+  await initLocalFft();
 }
 
 /**
@@ -302,7 +333,7 @@ async function initializePlayerEvents(): Promise<void> {
     // The FFT stream belongs to playback, not to either visualizer view. Start
     // it before any component mounts so local files update the shared store even
     // while the player is on another route or in the mini-player window.
-    await ensureLocalFftListener();
+    await initLocalFft();
 
     // Track changed — update current track
     unlisten.push(await events.onTrackChanged((track: Track) => {
@@ -373,13 +404,22 @@ async function initializePlayerEvents(): Promise<void> {
     }));
 
   // Stream resolved — remote playback URL ready; load into HTMLAudio
-    unlisten.push(await events.onStreamResolved((payload: events.StreamResolvedEvent) => {
+    unlisten.push(await events.onStreamResolved(async (payload: events.StreamResolvedEvent) => {
     const track = get(currentTrack);
     if (track && shouldAcceptStreamResolution(track, payload)) {
-      loadRemoteStream(track, payload.streamUrl, payload.remoteUrl, payload.proxyCapability).catch((e) => {
+      try {
+        await loadRemoteStream(track, payload.streamUrl, payload.remoteUrl, payload.proxyCapability);
+        if (!get(remoteActive)) throw new Error('Remote audio did not start');
+        if (focusRemoteStart?.trackId === track.id && focusRemoteStart.position != null && focusRemoteStart.position > 0) {
+          seekRemote(focusRemoteStart.position);
+        }
+        settleFocusRemoteStart(track.id);
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(extractErrorMessage(e, get(t)));
+        settleFocusRemoteStart(track.id, error);
         const msg = extractErrorMessage(e, get(t));
         notifications.push({ type: 'error', title: 'Remote Playback Error', message: msg, dismissible: true });
-      });
+      }
     }
     }));
 
@@ -408,10 +448,8 @@ async function initializePlayerEvents(): Promise<void> {
     initialized = true;
   } catch (error) {
     for (const stopListening of unlisten) stopListening();
-    if (fftListenerUnlisten) {
-      fftListenerUnlisten();
-      fftListenerUnlisten = null;
-    }
+    // FFT ownership is application-wide. A later player-listener failure must
+    // not tear down a healthy analyser stream established before this attempt.
     throw error;
   }
 }
@@ -464,6 +502,43 @@ export async function playTrack(track: Track): Promise<void> {
   }
 }
 
+/** Play without swallowing failures so Focus can correlate directive outcomes. */
+export async function playTrackForFocus(track: Track): Promise<void> {
+  await dispatchTrackForFocus(track);
+}
+
+async function dispatchTrackForFocus(track: Track, position: number | null = null): Promise<void> {
+  if (track.localPath) {
+    commands.invalidateStreamRequests();
+    stopRemote();
+    await prepareLocalFft();
+    await commands.playLocal(track.localPath);
+    if (position != null && position > 0) await commands.seek(position);
+    return;
+  }
+
+  selectFftSource('remote');
+  cancelFocusRemoteStart();
+  const started = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      settleFocusRemoteStart(track.id, new Error('Remote audio start timed out'));
+    }, 30_000);
+    focusRemoteStart = { trackId: track.id, position, resolve, reject, timeout };
+  });
+  try {
+    await commands.playStream(track);
+    await started;
+  } catch (error) {
+    settleFocusRemoteStart(track.id, error instanceof Error ? error : new Error(String(error)));
+    throw error;
+  }
+}
+
+/** Replay a retained track and restore its last known position. */
+export async function replayTrackForFocus(track: Track, position: number): Promise<void> {
+  await dispatchTrackForFocus(track, position);
+}
+
 /**
  * Skip to next track, auto-advancing past tracks that fail to resolve (e.g. DRM).
  * Tries up to 10 consecutive tracks before giving up to prevent infinite loops.
@@ -505,6 +580,12 @@ export async function pauseTrack(): Promise<void> {
   }
 }
 
+export async function pauseTrackForFocus(): Promise<void> {
+  if (get(remoteActive)) pauseRemote();
+  await commands.pause();
+  isPlaying.set(false);
+}
+
 /** Resume paused playback. */
 export async function resumeTrack(): Promise<void> {
   isPlaying.set(true);
@@ -520,6 +601,16 @@ export async function resumeTrack(): Promise<void> {
     const msg = extractErrorMessage(e, get(t));
     notifications.push({ type: 'error', title: 'Playback Error', message: msg, dismissible: true });
   }
+}
+
+export async function resumeTrackForFocus(): Promise<void> {
+  if (get(remoteActive)) {
+    await resumeRemoteOrThrow();
+    await commands.resume().catch(() => undefined);
+  } else {
+    await commands.resume();
+  }
+  isPlaying.set(true);
 }
 
 /** Skip to next track. */
@@ -558,6 +649,14 @@ export async function seekTo(position: number): Promise<void> {
     const msg = extractErrorMessage(e, get(t));
     notifications.push({ type: 'error', title: 'Playback Error', message: msg, dismissible: true });
   }
+}
+
+/** Stop playback without mutating the queue. */
+export async function stopTrackForFocus(): Promise<void> {
+  cancelFocusRemoteStart();
+  if (get(remoteActive)) stopRemote();
+  await commands.stop();
+  isPlaying.set(false);
 }
 
 /** Set volume (0-100, the user-facing unit). Scales to 0.0-1.0 for the Rust

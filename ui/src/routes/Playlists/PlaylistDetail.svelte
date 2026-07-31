@@ -3,12 +3,14 @@
   import { get } from 'svelte/store';
   import { navigate } from '@app/router/navigation';
   import { t } from '@i18n';
-  import { Play, Trash2, Edit3, ArrowLeft, Music, Folder } from 'lucide-svelte';
+  import { Play, Trash2, Edit3, ArrowLeft, Music, Folder, Plus, PlayCircle, Youtube, Loader2 } from 'lucide-svelte';
   import { playlists } from '@features/playlists/stores/playlists';
-  import { playTrack, addToQueueAction } from '@shared/utils/actions';
-  import { getPlaylistTracks, removeTrackFromPlaylist, getPlaylistThumbnails, getChildPlaylists, countPlaylistTracks } from '@services/commands';
+  import { playTrack, addToQueueAction, playNextAction } from '@shared/utils/actions';
+  import { getPlaylistTracks, removeTrackFromPlaylist, getPlaylistThumbnails, getChildPlaylists, countPlaylistTracks, resolveTrack, addTrackToPlaylist } from '@services/commands';
   import { albumArtUrl } from '@shared/utils/assetUrl';
+  import { notifications } from '@shared/stores/notifications';
   import JellyxLogo from '@shared/components/JellyxLogo.svelte';
+  import { extractDroppedSourceInput, extractYouTubeVideoId } from './sourceImport';
   import type { Track, PlaylistTrackEntry, UserPlaylist } from '@shared/types/models';
 
   export let id: string;
@@ -21,6 +23,10 @@
   let editingTitle = false;
   let editTitleValue = '';
   let showDeleteDialog = false;
+  let showImportInput = false;
+  let importUrl = '';
+  let importing = false;
+  let dragOver = false;
   let titleInputEl: HTMLInputElement | undefined;
 
   let lastLoadedId = '';
@@ -152,10 +158,66 @@
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   }
 
+  async function importYouTubeTrack(input: string): Promise<boolean> {
+    const videoId = extractYouTubeVideoId(input);
+    if (!videoId) {
+      notifications.push({ type: 'error', title: 'Import failed', message: 'Enter a valid YouTube video URL or ID', dismissible: true });
+      return false;
+    }
+
+    importing = true;
+    try {
+      const track = await resolveTrack('YouTube', videoId);
+      await addTrackToPlaylist(id, track);
+      await Promise.all([loadTracks(), loadThumbnails()]);
+      notifications.push({ type: 'success', title: 'Added to playlist', message: track.title, dismissible: true });
+      return true;
+    } catch (error) {
+      notifications.push({ type: 'error', title: 'Import failed', message: String(error), dismissible: true });
+      return false;
+    } finally {
+      importing = false;
+    }
+  }
+
+  async function handleImportSubmit(): Promise<void> {
+    if (!importUrl.trim() || importing) return;
+    if (await importYouTubeTrack(importUrl)) {
+      importUrl = '';
+      showImportInput = false;
+    }
+  }
+
+  function handleDragOver(event: DragEvent): void {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    dragOver = true;
+  }
+
+  async function handleDrop(event: DragEvent): Promise<void> {
+    event.preventDefault();
+    dragOver = false;
+    if (!event.dataTransfer) return;
+
+    const input = await extractDroppedSourceInput(event.dataTransfer);
+    if (input) {
+      await importYouTubeTrack(input);
+    } else {
+      notifications.push({ type: 'warning', title: 'Import failed', message: 'No URL found in the dropped text', dismissible: true });
+    }
+  }
+
   $: uniqueThumbnails = Array.from(new Set(thumbnails));
 </script>
 
-<div class="page-playlist-detail">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="page-playlist-detail"
+  class:drag-active={dragOver}
+  on:dragover={handleDragOver}
+  on:dragleave={() => (dragOver = false)}
+  on:drop={handleDrop}
+>
   <button class="back-btn" on:click={() => navigate('/playlists')} type="button">
     <ArrowLeft size={18} />
     <span>Back</span>
@@ -214,10 +276,30 @@
           <Play size={16} />
           <span>Play all</span>
         </button>
+        <button class="icon-btn import-btn" on:click={() => (showImportInput = !showImportInput)} title="Import from YouTube" type="button">
+          {#if importing}<Loader2 size={16} class="spin" />{:else}<Youtube size={16} />{/if}
+          <span>Import</span>
+        </button>
         <button class="icon-btn delete-btn" on:click={() => (showDeleteDialog = true)} title="Delete list" type="button">
           <Trash2 size={16} />
         </button>
       </div>
+      {#if showImportInput}
+        <div class="import-row">
+          <input
+            class="import-input"
+            type="text"
+            aria-label="YouTube video URL or ID"
+            placeholder="Paste a YouTube video URL or ID"
+            bind:value={importUrl}
+            on:keydown={(event) => event.key === 'Enter' && handleImportSubmit()}
+            disabled={importing}
+          />
+          <button class="icon-btn import-submit" on:click={handleImportSubmit} disabled={importing || !importUrl.trim()} title="Add track" type="button">
+            {#if importing}<Loader2 size={16} class="spin" />{:else}<Plus size={16} />{/if}
+          </button>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -272,6 +354,12 @@
             <span class="track-artist">{entry.track.artist}</span>
           </div>
           <span class="track-duration">{formatDuration(entry.track.duration)}</span>
+          <button class="queue-btn" on:click={() => playNextAction(entry.track)} title="Play next" aria-label="Play {entry.track.title} next" type="button">
+            <PlayCircle size={14} />
+          </button>
+          <button class="queue-btn" on:click={() => addToQueueAction(entry.track)} title="Add to queue" aria-label="Add {entry.track.title} to queue" type="button">
+            <Plus size={14} />
+          </button>
           <button class="remove-btn" on:click={() => handleRemoveTrack(entry.position)} title="Remove" type="button">
             <Trash2 size={14} />
           </button>
@@ -628,6 +716,27 @@
     color: #ef4444;
   }
 
+  .queue-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #9ca3af);
+    cursor: pointer;
+    padding: 0.25rem;
+    display: flex;
+    opacity: 0;
+    transition: opacity 0.2s, color 0.2s;
+  }
+
+  .track-row:hover .queue-btn,
+  .track-row:focus-within .queue-btn {
+    opacity: 1;
+  }
+
+  .queue-btn:hover,
+  .queue-btn:focus-visible {
+    color: var(--color-accent, #6366f1);
+  }
+
   .delete-btn {
     color: #ef4444;
   }
@@ -635,6 +744,57 @@
   .delete-btn:hover {
     background: rgba(239, 68, 68, 0.15);
     color: #f87171;
+  }
+
+  .import-btn {
+    color: #ff3333;
+  }
+
+  .import-row {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+    max-width: 440px;
+  }
+
+  .import-input {
+    flex: 1;
+    min-width: 0;
+    padding: 0.4rem 0.75rem;
+    background: var(--bg-elevated, #1f2937);
+    border: 1px solid var(--border-color, #1f2937);
+    border-radius: 8px;
+    color: var(--text-primary, #e0e0e0);
+    font: inherit;
+  }
+
+  .import-input:focus {
+    border-color: var(--color-accent, #6366f1);
+    outline: none;
+  }
+
+  .import-submit {
+    background: var(--color-accent, #6366f1);
+    color: white;
+  }
+
+  .page-playlist-detail.drag-active {
+    outline: 2px dashed var(--color-accent, #6366f1);
+    outline-offset: -4px;
+  }
+
+  :global(.spin) {
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (hover: none) {
+    .queue-btn {
+      opacity: 1;
+    }
   }
 
   .dialog-overlay {

@@ -46,6 +46,10 @@ export function resume(): Promise<void> {
   return invokeCommand<void>('resume');
 }
 
+export function stop(): Promise<void> {
+  return invokeCommand<void>('stop');
+}
+
 export function next(): Promise<void> {
   return invokeCommand<void>('next');
 }

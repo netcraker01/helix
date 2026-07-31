@@ -73,17 +73,30 @@ export function onUpdateAvailable(cb: (info: UpdateInfo) => void): Promise<Unlis
  * The Rust side serializes `FrequencyData` as JSON via `webview.emit()`.
  * `bins` arrives as a plain `number[]` which we convert to `Float32Array`.
  */
-interface FftFramePayload {
+export interface FftFramePayload {
   bins: number[];
   sampleRate: number;
   peak: number;
 }
 
-export function frequencyDataFromFftPayload(payload: FftFramePayload): FrequencyData {
+export function frequencyDataFromFftPayload(payload: unknown): FrequencyData {
+  if (!payload || typeof payload !== 'object') throw new TypeError('Invalid FFT frame payload');
+  if ('sample_rate' in payload) throw new TypeError('Invalid FFT frame payload: legacy sample_rate casing');
+
+  const frame = payload as Partial<FftFramePayload>;
+  if (!Array.isArray(frame.bins)
+    || !frame.bins.every((value) => Number.isFinite(value) && value >= 0)
+    || !Number.isFinite(frame.sampleRate)
+    || (frame.sampleRate ?? 0) <= 0
+    || !Number.isFinite(frame.peak)
+    || (frame.peak ?? -1) < 0) {
+    throw new TypeError('Invalid FFT frame payload: expected finite non-negative values');
+  }
+
   return {
-    bins: new Float32Array(payload.bins),
-    sampleRate: payload.sampleRate,
-    peak: payload.peak,
+    bins: new Float32Array(frame.bins),
+    sampleRate: frame.sampleRate!,
+    peak: frame.peak!,
   };
 }
 

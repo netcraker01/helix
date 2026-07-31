@@ -2,6 +2,7 @@
 """Deterministic release-workflow contracts without third-party YAML tooling."""
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -25,6 +26,10 @@ for workflow, channel in (
     (windows, "windows-portable"), (macos, "macos-dmg"),
 ):
     require(workflow, f"JELLYX_INSTALL_CHANNEL: {channel}", "workflow")
+
+require(windows, "CARGO_INCREMENTAL: 0", "windows.yml deterministic build setting")
+if "Cache Cargo build" in windows or "path: |\n            target" in windows:
+    raise SystemExit("windows.yml: CI builds must not reuse target outputs")
 
 for workflow in (release, windows):
     if "--bundles msi,nsis" in workflow:
@@ -63,7 +68,10 @@ require(macos, "workflow_call:", "macos-dmg.yml")
 if 'tags: ["v*"]' in macos:
     raise SystemExit("macos-dmg.yml must not independently publish tag releases")
 
-version = "0.4.1"
+version_match = re.search(r'^version = "([^"]+)"', (ROOT / "jellyx-desktop/Cargo.toml").read_text(), re.MULTILINE)
+if version_match is None:
+    raise SystemExit("jellyx-desktop/Cargo.toml: missing package version")
+version = version_match.group(1)
 # Generate the release body inline instead of calling the bash script,
 # which fails on Windows runners where bash/git-tag availability is
 # inconsistent. The test only needs to verify that the body contains
