@@ -52,7 +52,7 @@ export interface FocusStore extends Writable<FocusState> {
   ): Promise<void>;
   pause(): Promise<void>;
   resume(): Promise<void>;
-  skip(): Promise<void>;
+  skip(): Promise<boolean>;
   end(): Promise<void>;
   discard(): Promise<void>;
   recover(action: FocusRecoveryAction): Promise<void>;
@@ -262,9 +262,18 @@ function createFocusStore(): FocusStore {
       update((s) => ({ ...s, loading: true, error: null }));
       try {
         const session = requireSession();
-        await runMutation(() => skipFocus(makeRequestId(), session.id, session.revision));
+        const result = await skipFocus(makeRequestId(), session.id, session.revision);
+        update((s) => ({
+          ...s,
+          session: result.snapshot,
+          loading: false,
+          pendingDirective: result.playbackDirective ?? s.pendingDirective,
+          recoveryRequired: false,
+        }));
+        return true;
       } catch (e) {
         setError(e);
+        return false;
       }
     },
 

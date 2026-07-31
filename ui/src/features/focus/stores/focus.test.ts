@@ -349,6 +349,16 @@ describe('focusStore', () => {
     expect(get(focusStore).recoveryRequired).toBe(false);
   });
 
+  it('reports a failed skip so the deadline runtime can retry it', async () => {
+    const session = makeSession();
+    mocks.startFocusSession.mockResolvedValueOnce({ operationId: 'op-1', snapshot: session });
+    await focusStore.start('Deep work', '', '', 'pomodoro', session.cadence, { kind: 'none' });
+    mocks.skipFocus.mockRejectedValueOnce(new Error('skip unavailable'));
+
+    await expect(focusStore.skip()).resolves.toBe(false);
+    expect(get(focusStore).error).toBe('skip unavailable');
+  });
+
   it('starts and stops the event listener', async () => {
     const unlisten = await startFocusListener();
     expect(mocks.onFocusEvent).toHaveBeenCalledWith(expect.any(Function));
@@ -357,5 +367,13 @@ describe('focusStore', () => {
     stopFocusListener();
     // Calling again is safe and idempotent.
     stopFocusListener();
+  });
+
+  it('allows listener registration to retry after a failure', async () => {
+    mocks.onFocusEvent.mockRejectedValueOnce(new Error('listener unavailable'));
+
+    await expect(startFocusListener()).rejects.toThrow('listener unavailable');
+    await expect(startFocusListener()).resolves.toEqual(expect.any(Function));
+    expect(mocks.onFocusEvent).toHaveBeenCalledTimes(2);
   });
 });

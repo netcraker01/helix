@@ -27,7 +27,9 @@ export function advanceExpiredFocus(session: FocusSession | null, now = Date.now
   const key = deadlineKey(session);
   if (!key || advancingDeadlines.has(key)) return false;
   advancingDeadlines.add(key);
-  void focusStore.skip();
+  void focusStore.skip().then((skipped) => {
+    if (!skipped) advancingDeadlines.delete(key);
+  }).catch(() => advancingDeadlines.delete(key));
   return true;
 }
 
@@ -84,7 +86,11 @@ async function handleDirective(directive: FocusPlaybackDirective | null | undefi
 export async function initFocusRuntime(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await startFocusListener();
+  try {
+    await startFocusListener();
+  } catch {
+    // Focus events are optional at startup; loading still provides a usable snapshot.
+  }
   await focusStore.load();
   focusStore.subscribe((state) => {
     advanceExpiredFocus(state.session);

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { focusStore } from './stores/focus';
-import { advanceExpiredFocus, executeFocusDirective, resetFocusRuntimeForTests } from './runtime';
+import * as focus from './stores/focus';
+import { advanceExpiredFocus, executeFocusDirective, initFocusRuntime, resetFocusRuntimeForTests } from './runtime';
 import type { FocusSession } from './types';
 import * as commands from '@services/commands';
 import * as player from '@features/player/stores/player';
@@ -26,7 +27,7 @@ describe('Focus runtime deadline owner', () => {
   });
 
   it('dispatches once per session revision and deadline', () => {
-    const skip = vi.spyOn(focusStore, 'skip').mockResolvedValue(undefined);
+    const skip = vi.spyOn(focusStore, 'skip').mockResolvedValue(true);
     expect(advanceExpiredFocus(session(), 100)).toBe(true);
     expect(advanceExpiredFocus(session(), 101)).toBe(false);
     expect(advanceExpiredFocus(session({ revision: 1, phase: 'break', state: 'runningBreak', phaseDeadlineAt: 150 }), 150)).toBe(true);
@@ -35,10 +36,31 @@ describe('Focus runtime deadline owner', () => {
   });
 
   it('advances final work so the backend can complete it', () => {
-    const skip = vi.spyOn(focusStore, 'skip').mockResolvedValue(undefined);
+    const skip = vi.spyOn(focusStore, 'skip').mockResolvedValue(true);
     expect(advanceExpiredFocus(session({ round: 4 }), 100)).toBe(true);
     expect(skip).toHaveBeenCalledTimes(1);
     skip.mockRestore();
+  });
+
+  it('retries an expired deadline after its skip fails', async () => {
+    const skip = vi.spyOn(focusStore, 'skip')
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    expect(advanceExpiredFocus(session(), 100)).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(advanceExpiredFocus(session(), 101)).toBe(true);
+    expect(skip).toHaveBeenCalledTimes(2);
+  });
+
+  it('continues Focus startup when event listener registration fails', async () => {
+    vi.spyOn(focus, 'startFocusListener').mockRejectedValueOnce(new Error('listener unavailable'));
+    const load = vi.spyOn(focusStore, 'load').mockResolvedValue(undefined);
+    vi.spyOn(globalThis, 'setInterval').mockReturnValue(0 as never);
+
+    await expect(initFocusRuntime()).resolves.toBeUndefined();
+    expect(load).toHaveBeenCalledOnce();
   });
 
   it('treats an empty query selection as playback failure', async () => {
