@@ -4,14 +4,28 @@
   import type { FrequencyData } from '@shared/types/models';
   import { resolveVisualizerMode, type VisualizerModeEntry } from '../visualizers/registry';
   import { limitFrequencyRange, createActiveRange, type ActiveRangeState } from '../visualizers/activeRange';
+  import { createSpectrumAnalyzer } from '../visualizers/analyzeSpectrum';
+  import { createFrameInterpolator } from '../visualizers/frameInterpolation';
+  import { createVisualizerPalette, getCanvasContext } from '../visualizers/runtime';
   import type { VisualizerTheme } from '../visualizers/types';
   import VisualizerSelector from './VisualizerSelector.svelte';
+  import {
+    auroraBeatMode,
+    auroraSpeed,
+    visualizerReactivity,
+    vizColor,
+    vizColorMode,
+  } from '../stores/visualizerSettings';
 
   let canvas: HTMLCanvasElement;
   let overlayEl: HTMLDivElement | null = null;
   let rafId: number | null = null;
+  let resizeObserver: ResizeObserver | null = null;
 
   const activeRange: ActiveRangeState = createActiveRange();
+  const analyze = createSpectrumAnalyzer();
+  const interpolate = createFrameInterpolator(0.35);
+  const palette = createVisualizerPalette();
 
   // ── Auto-hide overlay chrome ────────────────────────────────────
   /** Whether the overlay chrome (close button + selector) is currently visible.
@@ -78,9 +92,7 @@
   let currentData: FrequencyData | null = null;
 
   // Subscribe to frequency data and keep local reference for rAF loop
-  $: if ($frequencyData) {
-    currentData = $frequencyData;
-  }
+  $: currentData = $frequencyData;
 
   // Resolve the active renderer from the persisted mode id. Re-evaluated only
   // when the mode id changes — the rAF loop reads `activeMode` directly, so a
@@ -96,6 +108,12 @@
 
     // Start rAF loop
     startRenderLoop();
+
+    const parent = canvas?.parentElement;
+    if (parent && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(handleResize);
+      resizeObserver.observe(parent);
+    }
 
     // Escape key exits Modo Cine
     function handleKeydown(e: KeyboardEvent): void {
@@ -116,8 +134,8 @@
   let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
 
   function startRenderLoop(): void {
-    function frame(): void {
-      renderFrame();
+    function frame(time: number): void {
+      renderFrame(time);
       rafId = requestAnimationFrame(frame);
     }
     rafId = requestAnimationFrame(frame);
@@ -152,16 +170,13 @@
 
   function getCtx(): CanvasRenderingContext2D | null {
     if (cachedCtx) return cachedCtx;
-    cachedCtx = canvas.getContext('2d', {
-      alpha: true,
-      desynchronized: true,
-      willReadFrequently: false,
-    }) as CanvasRenderingContext2D | null;
+    cachedCtx = getCanvasContext(canvas, true);
     return cachedCtx;
   }
 
-  function renderFrame(): void {
+  function renderFrame(time: number): void {
     if (!canvas) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
 
     const ctx = getCtx();
     if (!ctx) return;
@@ -175,10 +190,20 @@
     // Render only the musically-useful part of the spectrum. The raw FFT spans
     // the full Nyquist range; trimming the upper tail avoids bars/cells that
     // sit at zero most of the time and makes all visualizers feel more alive.
-    const displayData = currentData ? limitFrequencyRange(activeRange, currentData, $currentTrack?.id) : null;
+    const rangedData = currentData ? limitFrequencyRange(activeRange, currentData, $currentTrack?.id) : null;
+    const displayData = interpolate(rangedData, $visualizerReactivity);
+    const analysis = analyze(displayData);
+    const colors = palette(time, {
+      color: $vizColor,
+      mode: $vizColorMode,
+      speed: $auroraSpeed,
+      beatMode: $auroraBeatMode,
+    }, analysis.beat);
+    cachedTheme.accentColor = colors[0];
+    cachedTheme.palette = colors;
+    cachedTheme.reactivity = $visualizerReactivity;
 
-    // Dispatch to the active renderer (pure Canvas2D, no state).
-    activeMode.render(ctx, width, height, displayData, cachedTheme);
+    activeMode.render(ctx, width, height, displayData, cachedTheme, analysis);
   }
 
   function handleResize(): void {
@@ -208,6 +233,8 @@
       window.removeEventListener('keydown', keydownHandler);
       keydownHandler = null;
     }
+    resizeObserver?.disconnect();
+    resizeObserver = null;
     clearIdleTimer();
   });
 

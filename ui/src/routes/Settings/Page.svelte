@@ -7,6 +7,16 @@
   import { Library, Languages, Plug, Volume2, Monitor, Github, ExternalLink, Palette, Activity } from 'lucide-svelte';
   import { MINI_PLAYER_SCALE_BOUNDS, MINI_PLAYER_SKINS, activateMiniPlayerSkin, miniPlayerScale, selectedMiniPlayerSkinId, setMiniPlayerScale } from '@features/mini-player/skins';
   import { getMigratedItem, setMigratedItem } from '@shared/utils/storage';
+  import {
+    auroraBeatMode,
+    auroraSpeed,
+    setAuroraSpeed,
+    setVisualizerReactivity,
+    setVizColor,
+    visualizerReactivity,
+    vizColor,
+    vizColorMode,
+  } from '@features/player/stores/visualizerSettings';
 
   let version = '';
   let versionError: string | null = null;
@@ -145,6 +155,10 @@
     setMiniPlayerScale(Number(input.value));
   }
 
+  function handleVisualizerNumber(e: Event, setter: (value: number) => void) {
+    setter(Number((e.target as HTMLInputElement).value));
+  }
+
   const SUPPORTED_LOCALES = [
     { code: 'en', label: 'English' },
     { code: 'es', label: 'Español' },
@@ -180,6 +194,45 @@
         <span class="toggle-slider"></span>
       </label>
     </div>
+  </section>
+
+  <section class="settings-section">
+    <div class="section-header">
+      <Activity size={20} />
+      <h2>{$t('settings.visualizer.title')}</h2>
+    </div>
+    <div class="setting-row">
+      <span class="setting-label">{$t('settings.visualizer.colorMode')}</span>
+      <select bind:value={$vizColorMode} aria-label={$t('settings.visualizer.colorMode')}>
+        <option value="fixed">{$t('settings.visualizer.colorModeOptions.fixed')}</option>
+        <option value="aurora">{$t('settings.visualizer.colorModeOptions.aurora')}</option>
+      </select>
+    </div>
+    {#if $vizColorMode === 'fixed'}
+      <div class="setting-row">
+        <label for="visualizer-color">{$t('settings.visualizer.color')}</label>
+        <input id="visualizer-color" type="color" value={$vizColor} on:input={(event) => setVizColor(event.currentTarget.value)} />
+      </div>
+    {:else}
+      <div class="setting-row">
+        <span class="setting-label">{$t('settings.visualizer.auroraBeatMode')}</span>
+        <label class="toggle">
+          <input type="checkbox" bind:checked={$auroraBeatMode} aria-label={$t('settings.visualizer.auroraBeatMode')} />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="setting-row">
+        <label for="aurora-speed">{$t('settings.visualizer.auroraSpeed')}</label>
+        <input id="aurora-speed" class="slider" type="range" min="0.5" max="2" step="0.1" value={$auroraSpeed} on:input={(event) => handleVisualizerNumber(event, setAuroraSpeed)} />
+        <span class="setting-value">{$auroraSpeed.toFixed(1)}</span>
+      </div>
+    {/if}
+    <div class="setting-row">
+      <label for="visualizer-reactivity">{$t('settings.visualizer.reactivity')}</label>
+      <input id="visualizer-reactivity" class="slider" type="range" min="0.5" max="2" step="0.1" value={$visualizerReactivity} on:input={(event) => handleVisualizerNumber(event, setVisualizerReactivity)} />
+      <span class="setting-value">{$visualizerReactivity.toFixed(1)}</span>
+    </div>
+    <p class="section-desc">{$t('settings.visualizer.reactivityHint')}</p>
   </section>
 
   <section class="settings-section">

@@ -9,32 +9,43 @@
   import { onMount, onDestroy } from 'svelte';
   import { frequencyData, currentTrack } from '@features/player/stores/player';
   import { limitFrequencyRange, createActiveRange, type ActiveRangeState } from '@features/player/visualizers/activeRange';
+  import { createSpectrumAnalyzer } from '@features/player/visualizers/analyzeSpectrum';
+  import { createFrameInterpolator } from '@features/player/visualizers/frameInterpolation';
+  import { renderBars } from '@features/player/visualizers/bars';
+  import { createVisualizerPalette, getCanvasContext } from '@features/player/visualizers/runtime';
+  import {
+    auroraBeatMode,
+    auroraSpeed,
+    visualizerReactivity,
+    vizColor,
+    vizColorMode,
+  } from '@features/player/stores/visualizerSettings';
   import type { FrequencyData } from '@shared/types/models';
+  import type { VisualizerTheme } from '@features/player/visualizers/types';
 
   let canvas: HTMLCanvasElement;
   let rafId: number | null = null;
   let ro: ResizeObserver | null = null;
 
   const activeRange: ActiveRangeState = createActiveRange();
+  const analyze = createSpectrumAnalyzer();
+  const interpolate = createFrameInterpolator(0.5);
+  const palette = createVisualizerPalette();
 
   let currentData: FrequencyData | null = null;
-  $: if ($frequencyData) currentData = $frequencyData;
+  $: currentData = $frequencyData;
 
-  const BAR_GAP = 2;
-  const BAR_MIN_HEIGHT = 6;
-  const ACCENT_COLOR = '#6366f1';
-  /** Only draw bars whose magnitude exceeds this fraction of peak. */
-  const ENERGY_THRESHOLD = 0.03;
+  const theme: VisualizerTheme = {
+    accentColor: '#6366f1',
+    barGap: 2,
+    barMinHeight: 6,
+  };
 
   let cachedCtx: CanvasRenderingContext2D | null = null;
 
   function getCtx(): CanvasRenderingContext2D | null {
     if (cachedCtx) return cachedCtx;
-    cachedCtx = canvas.getContext('2d', {
-      alpha: false,
-      desynchronized: true,
-      willReadFrequently: false,
-    }) as CanvasRenderingContext2D | null;
+    cachedCtx = getCanvasContext(canvas, false);
     return cachedCtx;
   }
 
@@ -56,45 +67,9 @@
     }
   }
 
-  /**
-   * Render bars — only bins with meaningful energy get drawn.
-   * Active bars fill the entire width; silent bins are skipped entirely.
-   */
-  function renderActiveBars(
-    ctx: CanvasRenderingContext2D,
-    width: number,
-    height: number,
-    data: FrequencyData
-  ): void {
-    const { bins, peak } = data;
-    if (!bins.length || peak <= 0 || width <= 0 || height <= 0) return;
-
-    // Collect only bins with energy above threshold.
-    const threshold = peak * ENERGY_THRESHOLD;
-    const active: number[] = [];
-    for (let i = 0; i < bins.length; i++) {
-      if (bins[i] >= threshold) active.push(bins[i]);
-    }
-    if (!active.length) return;
-
-    const barWidth = Math.max(1, (width - BAR_GAP * (active.length - 1)) / active.length);
-
-    ctx.fillStyle = ACCENT_COLOR;
-    for (let i = 0; i < active.length; i++) {
-      const normalizedHeight = active[i] / peak;
-      const shaped = Math.pow(normalizedHeight, 0.85);
-      const barHeight = Math.max(BAR_MIN_HEIGHT, shaped * height * 0.9);
-      const x = i * (barWidth + BAR_GAP);
-      const y = height - barHeight;
-
-      ctx.globalAlpha = 0.5 + shaped * 0.5;
-      ctx.fillRect(x, y, barWidth, barHeight);
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  function renderFrame(): void {
+  function renderFrame(time: number): void {
     if (!canvas) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (canvas.width === 0 || canvas.height === 0) {
       handleResize();
       if (canvas.width === 0 || canvas.height === 0) return;
@@ -103,14 +78,25 @@
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const raw = currentData ?? { bins: new Float32Array(0), sampleRate: 44100, peak: 0 };
-    const data = limitFrequencyRange(activeRange, raw, $currentTrack?.id);
-    renderActiveBars(ctx, canvas.width, canvas.height, data);
+    const rangedData = limitFrequencyRange(activeRange, raw, $currentTrack?.id);
+    const data = interpolate(rangedData, $visualizerReactivity);
+    const analysis = analyze(data);
+    const colors = palette(time, {
+      color: $vizColor,
+      mode: $vizColorMode,
+      speed: $auroraSpeed,
+      beatMode: $auroraBeatMode,
+    }, analysis.beat);
+    theme.accentColor = colors[0];
+    theme.palette = colors;
+    theme.reactivity = $visualizerReactivity;
+    renderBars(ctx, canvas.width, canvas.height, data, theme, analysis);
   }
 
   onMount(() => {
     handleResize();
-    const frame = (): void => {
-      renderFrame();
+    const frame = (time: number): void => {
+      renderFrame(time);
       rafId = requestAnimationFrame(frame);
     };
     rafId = requestAnimationFrame(frame);

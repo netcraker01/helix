@@ -11,9 +11,13 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::errors::types::PersistenceError;
+use crate::focus::models::{
+    FocusCadence, FocusCapture, FocusDegradation, FocusMusicStrategy, FocusPreferences,
+    FocusSession,
+};
 use crate::persistence::models::{
     ArtistFavorite, HistoryEntry, LocalTrackEntry, PlaylistTrackEntry, SourceSetting, UserPlaylist,
     WatchedFolder,
@@ -22,10 +26,11 @@ use crate::updater::prefs::UpdatePrefs;
 use jellyx_core::models::track::Track;
 
 /// Current schema version — increment when adding migrations.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 10;
 const SCHEMA_VERSION_V6: u32 = 6;
 const SCHEMA_VERSION_V7: u32 = 7;
 const SCHEMA_VERSION_V8: u32 = 8;
+const SCHEMA_VERSION_V10: u32 = 10;
 /// Singleton row key for settings tables that intentionally contain one row.
 const SETTINGS_SINGLETON_ID: i64 = 1;
 
@@ -100,6 +105,9 @@ impl Database {
     pub fn open_in_memory() -> Result<Self, PersistenceError> {
         let conn = Connection::open_in_memory().map_err(|e| {
             PersistenceError::DatabaseError(format!("failed to open in-memory database: {}", e))
+        })?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;").map_err(|e| {
+            PersistenceError::DatabaseError(format!("failed to enable foreign keys: {}", e))
         })?;
 
         let db = Self {
@@ -241,7 +249,7 @@ impl Database {
     /// column already exists, so we wrap them in a tolerance check) and, for
     /// the `artist_favorites` PK change, a full table rebuild.
     fn run_migrations(&self) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
+        let mut conn = self.conn.lock().map_err(|e| {
             PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
         })?;
 
@@ -265,8 +273,15 @@ impl Database {
 
         let needs_v7 = current < SCHEMA_VERSION_V7 || !Self::table_exists(&conn, "update_prefs");
         let needs_v8 = current < SCHEMA_VERSION_V8 || !Self::table_exists(&conn, "telemetry_prefs");
+        let needs_v10 = current < SCHEMA_VERSION_V10
+            || !Self::table_exists(&conn, "focus_sessions")
+            || !Self::table_exists(&conn, "focus_captures")
+            || !Self::table_exists(&conn, "focus_preferences")
+            || !Self::table_exists(&conn, "focus_operations")
+            || !Self::column_exists(&conn, "focus_sessions", "goal")
+            || !Self::column_exists(&conn, "focus_sessions", "first_action");
 
-        if current >= SCHEMA_VERSION && !needs_v6 && !needs_v7 && !needs_v8 {
+        if current >= SCHEMA_VERSION && !needs_v6 && !needs_v7 && !needs_v8 && !needs_v10 {
             return Ok(());
         }
 
@@ -285,6 +300,10 @@ impl Database {
         // v7 → v8: persist an explicit, default-off remote telemetry choice.
         if needs_v8 {
             Self::migrate_to_v8(&conn)?;
+        }
+
+        if needs_v10 {
+            Self::migrate_to_v10(&mut conn)?;
         }
 
         // Record the new schema version.
@@ -484,6 +503,85 @@ impl Database {
         .map_err(|e| {
             PersistenceError::DatabaseError(format!("failed to create telemetry_prefs (v8): {}", e))
         })
+    }
+
+    fn migrate_to_v10(conn: &mut Connection) -> Result<(), PersistenceError> {
+        let transaction = conn.transaction().map_err(database_error)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS focus_sessions (
+                    id TEXT PRIMARY KEY,
+                    intention TEXT NOT NULL CHECK (length(trim(intention)) > 0),
+                    goal TEXT NOT NULL DEFAULT '',
+                    first_action TEXT NOT NULL DEFAULT '',
+                    workflow TEXT NOT NULL CHECK (workflow IN ('pomodoro', 'deepWork', 'quickFocus', 'custom')),
+                    work_duration_ms INTEGER NOT NULL CHECK (work_duration_ms > 0),
+                    break_duration_ms INTEGER NOT NULL CHECK (break_duration_ms >= 0),
+                    rounds INTEGER NOT NULL CHECK (rounds > 0),
+                    round INTEGER NOT NULL CHECK (round > 0 AND round <= rounds),
+                    phase TEXT NOT NULL CHECK (phase IN ('work', 'break')),
+                    state TEXT NOT NULL CHECK (state IN ('draft', 'runningWork', 'pausedWork', 'awaitingTransition', 'runningBreak', 'pausedBreak', 'completed', 'discarded')),
+                    phase_started_at INTEGER,
+                    phase_deadline_at INTEGER,
+                    paused_remaining_ms INTEGER CHECK (paused_remaining_ms IS NULL OR paused_remaining_ms >= 0),
+                    revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+                    music_strategy TEXT NOT NULL CHECK (music_strategy IN ('none', 'continueCurrent', 'preset', 'query')),
+                    music_value TEXT,
+                    degradation_reason TEXT,
+                    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('completed', 'discarded')),
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_focus_sessions_one_nonterminal
+                    ON focus_sessions((1)) WHERE state NOT IN ('completed', 'discarded');
+                CREATE TABLE IF NOT EXISTS focus_captures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES focus_sessions(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK (kind IN ('note', 'distraction')),
+                    body TEXT NOT NULL CHECK (length(trim(body)) > 0),
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_focus_captures_session_created
+                    ON focus_captures(session_id, created_at, id);
+                CREATE TABLE IF NOT EXISTS focus_preferences (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    default_workflow TEXT NOT NULL DEFAULT 'pomodoro' CHECK (default_workflow IN ('pomodoro', 'deepWork', 'quickFocus', 'custom')),
+                    default_work_duration_ms INTEGER NOT NULL DEFAULT 1500000 CHECK (default_work_duration_ms > 0),
+                    default_break_duration_ms INTEGER NOT NULL DEFAULT 300000 CHECK (default_break_duration_ms >= 0),
+                    default_rounds INTEGER NOT NULL DEFAULT 4 CHECK (default_rounds > 0),
+                    default_music_strategy TEXT NOT NULL DEFAULT 'none' CHECK (default_music_strategy IN ('none', 'continueCurrent', 'preset', 'query')),
+                    default_music_value TEXT,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS focus_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    session_id TEXT REFERENCES focus_sessions(id) ON DELETE SET NULL,
+                    request_id TEXT NOT NULL UNIQUE,
+                    operation_kind TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
+            )
+            .map_err(database_error)?;
+
+        if !Self::column_exists(&transaction, "focus_sessions", "goal") {
+            transaction
+                .execute(
+                    "ALTER TABLE focus_sessions ADD COLUMN goal TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        if !Self::column_exists(&transaction, "focus_sessions", "first_action") {
+            transaction
+                .execute(
+                    "ALTER TABLE focus_sessions ADD COLUMN first_action TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
     }
 
     // ── Update Prefs ──────────────────────────────────────────────────
@@ -2133,11 +2231,454 @@ impl Database {
             .map(|s| s.source)
             .collect())
     }
+
+    pub fn focus_get_session(&self, id: &str) -> Result<Option<FocusSession>, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        let session = conn
+            .query_row(
+                &format!("{FOCUS_SESSION_SELECT} WHERE id = ?1"),
+                [id],
+                focus_session_from_row,
+            )
+            .optional()
+            .map_err(database_error)?;
+        session
+            .map(|mut session| {
+                session.captures = focus_captures(&conn, &session.id)?;
+                Ok(session)
+            })
+            .transpose()
+    }
+
+    pub fn focus_get_nonterminal_session(&self) -> Result<Option<FocusSession>, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        let session = conn
+            .query_row(
+                &format!(
+                    "{FOCUS_SESSION_SELECT} WHERE state NOT IN ('completed', 'discarded') LIMIT 1"
+                ),
+                [],
+                focus_session_from_row,
+            )
+            .optional()
+            .map_err(database_error)?;
+        session
+            .map(|mut session| {
+                session.captures = focus_captures(&conn, &session.id)?;
+                Ok(session)
+            })
+            .transpose()
+    }
+
+    pub fn focus_list_sessions(&self, limit: u32) -> Result<Vec<FocusSession>, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        let mut sessions = {
+            let mut statement = conn
+                .prepare(&format!(
+                    "{FOCUS_SESSION_SELECT} WHERE state IN ('completed', 'discarded') ORDER BY updated_at DESC LIMIT ?1"
+                ))
+                .map_err(database_error)?;
+            let sessions = statement
+                .query_map([limit], focus_session_from_row)
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            sessions
+        };
+        for session in &mut sessions {
+            session.captures = focus_captures(&conn, &session.id)?;
+        }
+        Ok(sessions)
+    }
+
+    pub fn focus_delete_session(&self, id: &str) -> Result<(), PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.execute(
+            "DELETE FROM focus_sessions WHERE id = ?1 AND state IN ('completed', 'discarded')",
+            [id],
+        )
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn focus_capture(
+        &self,
+        session_id: &str,
+        kind: &str,
+        body: &str,
+        created_at: i64,
+    ) -> Result<FocusCapture, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.execute(
+            "INSERT INTO focus_captures (session_id, kind, body, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, kind, body, created_at],
+        )
+        .map_err(database_error)?;
+        Ok(FocusCapture {
+            id: conn.last_insert_rowid(),
+            session_id: session_id.to_string(),
+            kind: focus_decode(kind.to_string()).map_err(database_error)?,
+            body: body.to_string(),
+            created_at,
+        })
+    }
+
+    pub fn focus_get_operation_result(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<FocusSession>, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        let result = conn
+            .query_row(
+                "SELECT result_json FROM focus_operations WHERE request_id = ?1",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        result
+            .map(|json| serde_json::from_str(&json).map_err(serialization_error))
+            .transpose()
+    }
+
+    pub fn focus_is_playback_directive(&self, request_id: &str) -> Result<bool, PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM focus_operations WHERE request_id = ?1 AND operation_kind = 'playbackDirective')",
+            [request_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+    }
+
+    pub fn focus_mark_playback_directive(&self, request_id: &str) -> Result<(), PersistenceError> {
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.execute(
+            "UPDATE focus_operations SET operation_kind = 'playbackDirective' WHERE request_id = ?1",
+            [request_id],
+        )
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn focus_get_preferences(&self) -> Result<FocusPreferences, PersistenceError> {
+        let defaults = FocusPreferences::default().normalized();
+        let (music_strategy, music_value) = focus_music_parts(&defaults.default_music_strategy);
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO focus_preferences (
+                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
+                default_rounds, default_music_strategy, default_music_value, updated_at
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                focus_name(&defaults.default_workflow)?,
+                defaults.default_cadence.work_duration_ms,
+                defaults.default_cadence.break_duration_ms,
+                defaults.default_cadence.rounds,
+                music_strategy,
+                music_value,
+            ],
+        )
+        .map_err(database_error)?;
+        conn.query_row(
+            "SELECT default_workflow, default_work_duration_ms, default_break_duration_ms,
+                    default_rounds, default_music_strategy, default_music_value
+             FROM focus_preferences WHERE id = 1",
+            [],
+            focus_preferences_from_row,
+        )
+        .map_err(database_error)
+    }
+
+    pub fn focus_set_preferences(
+        &self,
+        preferences: FocusPreferences,
+        now_ms: i64,
+    ) -> Result<FocusPreferences, PersistenceError> {
+        let preferences = preferences.normalized();
+        let (music_strategy, music_value) = focus_music_parts(&preferences.default_music_strategy);
+        let conn = self.conn.lock().map_err(lock_error)?;
+        conn.execute(
+            "INSERT INTO focus_preferences (
+                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
+                default_rounds, default_music_strategy, default_music_value, updated_at
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                default_workflow = excluded.default_workflow,
+                default_work_duration_ms = excluded.default_work_duration_ms,
+                default_break_duration_ms = excluded.default_break_duration_ms,
+                default_rounds = excluded.default_rounds,
+                default_music_strategy = excluded.default_music_strategy,
+                default_music_value = excluded.default_music_value,
+                updated_at = excluded.updated_at",
+            params![
+                focus_name(&preferences.default_workflow)?,
+                preferences.default_cadence.work_duration_ms,
+                preferences.default_cadence.break_duration_ms,
+                preferences.default_cadence.rounds,
+                music_strategy,
+                music_value,
+                now_ms,
+            ],
+        )
+        .map_err(database_error)?;
+        Ok(preferences)
+    }
+
+    pub fn focus_apply_session(
+        &self,
+        request_id: &str,
+        operation_id: &str,
+        operation_kind: &str,
+        expected_revision: Option<i64>,
+        session: &FocusSession,
+        now_ms: i64,
+    ) -> Result<FocusSession, PersistenceError> {
+        let mut conn = self.conn.lock().map_err(lock_error)?;
+        let transaction = conn.transaction().map_err(database_error)?;
+        if let Some(result_json) = transaction
+            .query_row(
+                "SELECT result_json FROM focus_operations WHERE request_id = ?1",
+                [request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(database_error)?
+        {
+            return serde_json::from_str(&result_json).map_err(serialization_error);
+        }
+
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM focus_sessions WHERE id = ?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        match (current_revision, expected_revision) {
+            (Some(current), Some(expected))
+                if current == expected && session.revision == current + 1 => {}
+            (None, None) if session.revision == 0 => {}
+            _ => {
+                return Err(PersistenceError::WriteError(
+                    "stale focus revision".to_string(),
+                ))
+            }
+        }
+
+        let (music_strategy, music_value) = focus_music_parts(&session.music_strategy);
+        transaction
+            .execute(
+                "INSERT INTO focus_sessions (
+                    id, intention, goal, first_action, workflow, work_duration_ms,
+                    break_duration_ms, rounds, round, phase, state, phase_started_at,
+                    phase_deadline_at, paused_remaining_ms, revision, music_strategy,
+                    music_value, degradation_reason, outcome, created_at, updated_at, completed_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?20, CASE WHEN ?19 IS NULL THEN NULL ELSE ?20 END
+                 ) ON CONFLICT(id) DO UPDATE SET
+                    intention = excluded.intention, goal = excluded.goal,
+                    first_action = excluded.first_action, workflow = excluded.workflow,
+                    work_duration_ms = excluded.work_duration_ms,
+                    break_duration_ms = excluded.break_duration_ms, rounds = excluded.rounds,
+                    round = excluded.round, phase = excluded.phase, state = excluded.state,
+                    phase_started_at = excluded.phase_started_at,
+                    phase_deadline_at = excluded.phase_deadline_at,
+                    paused_remaining_ms = excluded.paused_remaining_ms,
+                    revision = excluded.revision, music_strategy = excluded.music_strategy,
+                    music_value = excluded.music_value,
+                    degradation_reason = excluded.degradation_reason, outcome = excluded.outcome,
+                    updated_at = excluded.updated_at, completed_at = excluded.completed_at",
+                params![
+                    session.id,
+                    session.intention,
+                    session.goal,
+                    session.first_action,
+                    focus_name(&session.workflow)?,
+                    session.cadence.work_duration_ms,
+                    session.cadence.break_duration_ms,
+                    session.cadence.rounds,
+                    session.round,
+                    focus_name(&session.phase)?,
+                    focus_name(&session.state)?,
+                    session.phase_started_at,
+                    session.phase_deadline_at,
+                    session.paused_remaining_ms,
+                    session.revision,
+                    music_strategy,
+                    music_value,
+                    session
+                        .degradation
+                        .as_ref()
+                        .map(|value| value.reason.as_str()),
+                    session
+                        .outcome
+                        .map(|value| focus_name(&value))
+                        .transpose()?,
+                    now_ms,
+                ],
+            )
+            .map_err(database_error)?;
+
+        let result_json = serde_json::to_string(session).map_err(serialization_error)?;
+        transaction
+            .execute(
+                "INSERT INTO focus_operations
+                    (operation_id, session_id, request_id, operation_kind, result_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    operation_id,
+                    session.id,
+                    request_id,
+                    operation_kind,
+                    result_json,
+                    now_ms
+                ],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(session.clone())
+    }
+}
+
+const FOCUS_SESSION_SELECT: &str =
+    "SELECT id, intention, goal, first_action, workflow, work_duration_ms,
+            break_duration_ms, rounds, round, phase, state, phase_started_at,
+            phase_deadline_at, paused_remaining_ms, revision, music_strategy,
+            music_value, degradation_reason, outcome, updated_at FROM focus_sessions";
+
+fn lock_error<T: std::fmt::Display>(error: T) -> PersistenceError {
+    PersistenceError::DatabaseError(format!("failed to lock database: {error}"))
+}
+
+fn database_error(error: rusqlite::Error) -> PersistenceError {
+    PersistenceError::DatabaseError(error.to_string())
+}
+
+fn serialization_error(error: serde_json::Error) -> PersistenceError {
+    PersistenceError::WriteError(format!("failed to serialize Focus operation: {error}"))
+}
+
+fn focus_name<T: serde::Serialize>(value: &T) -> Result<String, PersistenceError> {
+    serde_json::to_value(value)
+        .map_err(serialization_error)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| PersistenceError::WriteError("Focus enum serialization failed".into()))
+}
+
+fn focus_decode<T: serde::de::DeserializeOwned>(value: String) -> rusqlite::Result<T> {
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn focus_music_parts(strategy: &FocusMusicStrategy) -> (&str, Option<&str>) {
+    match strategy {
+        FocusMusicStrategy::None => ("none", None),
+        FocusMusicStrategy::ContinueCurrent => ("continueCurrent", None),
+        FocusMusicStrategy::Preset(value) => ("preset", Some(value)),
+        FocusMusicStrategy::Query(value) => ("query", Some(value)),
+    }
+}
+
+fn focus_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusSession> {
+    let music_strategy: String = row.get(15)?;
+    let music_value: Option<String> = row.get(16)?;
+    Ok(FocusSession {
+        id: row.get(0)?,
+        intention: row.get(1)?,
+        goal: row.get(2)?,
+        first_action: row.get(3)?,
+        workflow: focus_decode(row.get(4)?)?,
+        cadence: FocusCadence {
+            work_duration_ms: row.get(5)?,
+            break_duration_ms: row.get(6)?,
+            rounds: row.get(7)?,
+        },
+        round: row.get(8)?,
+        phase: focus_decode(row.get(9)?)?,
+        state: focus_decode(row.get(10)?)?,
+        phase_started_at: row.get(11)?,
+        phase_deadline_at: row.get(12)?,
+        paused_remaining_ms: row.get(13)?,
+        revision: row.get(14)?,
+        music_strategy: match (music_strategy.as_str(), music_value) {
+            ("none", _) => FocusMusicStrategy::None,
+            ("continueCurrent", _) => FocusMusicStrategy::ContinueCurrent,
+            ("preset", Some(value)) => FocusMusicStrategy::Preset(value),
+            ("query", Some(value)) => FocusMusicStrategy::Query(value),
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+        degradation: row
+            .get::<_, Option<String>>(17)?
+            .map(|reason| FocusDegradation {
+                reason,
+                occurred_at: row.get(19).unwrap_or_default(),
+            }),
+        outcome: row
+            .get::<_, Option<String>>(18)?
+            .map(focus_decode)
+            .transpose()?,
+        captures: Vec::new(),
+    })
+}
+
+fn focus_captures(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<FocusCapture>, PersistenceError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, session_id, kind, body, created_at FROM focus_captures
+             WHERE session_id = ?1 ORDER BY created_at, id",
+        )
+        .map_err(database_error)?;
+    let captures = statement
+        .query_map([session_id], |row| {
+            Ok(FocusCapture {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: focus_decode(row.get(2)?)?,
+                body: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(database_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(database_error)?;
+    Ok(captures)
+}
+
+fn focus_preferences_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusPreferences> {
+    let music_strategy: String = row.get(4)?;
+    let music_value: Option<String> = row.get(5)?;
+    Ok(FocusPreferences {
+        default_workflow: focus_decode(row.get(0)?)?,
+        default_cadence: FocusCadence {
+            work_duration_ms: row.get(1)?,
+            break_duration_ms: row.get(2)?,
+            rounds: row.get(3)?,
+        },
+        default_music_strategy: match (music_strategy.as_str(), music_value) {
+            ("none", _) => FocusMusicStrategy::None,
+            ("continueCurrent", _) => FocusMusicStrategy::ContinueCurrent,
+            ("preset", Some(value)) => FocusMusicStrategy::Preset(value),
+            ("query", Some(value)) => FocusMusicStrategy::Query(value),
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        },
+    }
+    .normalized())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::focus::models::{
+        FocusCaptureKind, FocusOutcome, FocusPhase, FocusSessionState, FocusWorkflow,
+    };
     use jellyx_core::models::source::Source;
     use std::collections::HashMap;
 
@@ -2169,6 +2710,99 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let version = db.schema_version().unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    fn sample_focus_session(id: &str) -> FocusSession {
+        FocusSession {
+            id: id.to_string(),
+            intention: "Recover Focus".into(),
+            goal: "Restore integration".into(),
+            first_action: "Run focused tests".into(),
+            workflow: FocusWorkflow::Custom,
+            cadence: FocusCadence {
+                work_duration_ms: 1_000,
+                break_duration_ms: 250,
+                rounds: 2,
+            },
+            round: 1,
+            phase: FocusPhase::Work,
+            state: FocusSessionState::RunningWork,
+            phase_started_at: Some(100),
+            phase_deadline_at: Some(1_100),
+            paused_remaining_ms: None,
+            revision: 0,
+            music_strategy: FocusMusicStrategy::None,
+            degradation: None,
+            outcome: None,
+            captures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn focus_v10_schema_and_single_active_session_constraint_are_restored() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        for table in [
+            "focus_sessions",
+            "focus_captures",
+            "focus_preferences",
+            "focus_operations",
+        ] {
+            assert!(Database::table_exists(&conn, table), "missing {table}");
+        }
+        assert!(Database::column_exists(&conn, "focus_sessions", "goal"));
+        assert!(Database::column_exists(
+            &conn,
+            "focus_sessions",
+            "first_action"
+        ));
+        drop(conn);
+
+        let first = sample_focus_session("focus-1");
+        db.focus_apply_session("start-1", "operation-1", "start", None, &first, 100)
+            .unwrap();
+        let second = sample_focus_session("focus-2");
+        assert!(db
+            .focus_apply_session("start-2", "operation-2", "start", None, &second, 100)
+            .is_err());
+    }
+
+    #[test]
+    fn focus_repository_roundtrips_fields_captures_history_and_receipts() {
+        let db = Database::open_in_memory().unwrap();
+        let session = sample_focus_session("focus-roundtrip");
+        let started = db
+            .focus_apply_session("start", "operation-start", "start", None, &session, 100)
+            .unwrap();
+        assert_eq!(started.goal, "Restore integration");
+        assert_eq!(
+            db.focus_get_operation_result("start").unwrap(),
+            Some(started.clone())
+        );
+
+        db.focus_capture(&started.id, "note", "Persistence works", 200)
+            .unwrap();
+        let recovered = db.focus_get_session(&started.id).unwrap().unwrap();
+        assert_eq!(recovered.captures[0].kind, FocusCaptureKind::Note);
+
+        let mut completed = recovered;
+        completed.state = FocusSessionState::Completed;
+        completed.outcome = Some(FocusOutcome::Completed);
+        completed.phase_started_at = None;
+        completed.phase_deadline_at = None;
+        completed.revision = 1;
+        db.focus_apply_session(
+            "complete",
+            "operation-complete",
+            "end",
+            Some(0),
+            &completed,
+            300,
+        )
+        .unwrap();
+        assert_eq!(db.focus_list_sessions(20).unwrap().len(), 1);
+        db.focus_delete_session(&started.id).unwrap();
+        assert!(db.focus_get_session(&started.id).unwrap().is_none());
     }
 
     #[test]

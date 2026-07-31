@@ -30,7 +30,7 @@ describe('Sidebar navigation', () => {
 
   it('renders all primary routes', () => {
     const { getByText } = render(SidebarTestWrapper);
-    for (const label of ['Home', 'Search', 'Lists', 'Now Playing', 'Library', 'Settings']) {
+    for (const label of ['Home', 'Search', 'Lists', 'Now Playing', 'Library', 'Focus', 'Settings']) {
       expect(getByText(label)).toBeTruthy();
     }
   });
@@ -39,5 +39,11 @@ describe('Sidebar navigation', () => {
     const { getByText } = render(SidebarTestWrapper);
     await fireEvent.click(getByText('Library'));
     expect(window.location.hash).toBe('#/library');
+  });
+
+  it('navigates to Focus using hash history', async () => {
+    const { getByText } = render(SidebarTestWrapper);
+    await fireEvent.click(getByText('Focus'));
+    expect(window.location.hash).toBe('#/focus');
   });
 });

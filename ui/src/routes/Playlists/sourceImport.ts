@@ -30,15 +30,73 @@ export function extractYouTubeVideoId(input: string): string | null {
 
 export interface TextDropData {
   getData(format: string): string;
+  items?: ArrayLike<{
+    kind: string;
+    getAsString(callback: (value: string) => void): void;
+  }>;
+  files?: ArrayLike<{
+    name: string;
+    text(): Promise<string>;
+  }>;
 }
 
-export function extractDroppedSourceInput(data: TextDropData): string | null {
-  const uri = data
-    .getData('text/uri-list')
+function firstUri(value: string): string | null {
+  const uri = value
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find((line) => line && !line.startsWith('#'));
-  if (uri) return uri;
+  return uri || null;
+}
 
-  return data.getData('text/plain').trim() || null;
+function firstUrlLike(value: string): string | null {
+  const htmlHref = value.match(/href=["']([^"']+)["']/i)?.[1];
+  if (htmlHref) return htmlHref;
+
+  return value.match(/https?:\/\/[^\s"'<>]+/i)?.[0] ?? null;
+}
+
+function droppedString(value: string, format?: string): string | null {
+  const text = value.trim();
+  if (!text) return null;
+  if (format === 'text/uri-list') return firstUri(text);
+  if (format === 'text/html' || format === 'DownloadURL') {
+    return firstUrlLike(text);
+  }
+
+  return firstUrlLike(text) ?? validVideoId(text);
+}
+
+export async function extractDroppedSourceInput(data: TextDropData): Promise<string | null> {
+  for (const format of [
+    'text/uri-list',
+    'URL',
+    'text/x-moz-url',
+    'text',
+    'text/plain',
+    'text/html',
+    'DownloadURL',
+  ]) {
+    const input = droppedString(data.getData(format), format);
+    if (input) return input;
+  }
+
+  for (const item of Array.from(data.items ?? [])) {
+    if (item.kind !== 'string') continue;
+    const value = await new Promise<string>((resolve) => item.getAsString(resolve));
+    const input = droppedString(value);
+    if (input) return input;
+  }
+
+  for (const file of Array.from(data.files ?? [])) {
+    if (!file.name.toLowerCase().endsWith('.url')) continue;
+    try {
+      const shortcut = await file.text();
+      const input = shortcut.match(/^URL=(.+)$/im)?.[1]?.trim();
+      if (input) return firstUrlLike(input) ?? input;
+    } catch {
+      // Ignore unreadable shortcuts and continue checking the drop payload.
+    }
+  }
+
+  return null;
 }
