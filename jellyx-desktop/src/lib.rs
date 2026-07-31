@@ -6,6 +6,7 @@
 pub mod app;
 pub mod audio;
 pub mod errors;
+pub mod focus;
 pub mod ipc;
 pub mod library;
 pub mod observability;

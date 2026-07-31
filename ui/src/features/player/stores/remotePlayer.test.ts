@@ -14,6 +14,7 @@ import {
   proxyLocalUrl,
   loadRemoteStream,
   getAudioElement,
+  readAnalyserFrame,
 } from './remotePlayer';
 import { reportRemoteAudioPlaybackFailure, reportRemoteAudioPlaybackRuntimeFailure, reportRemoteAudioPlaybackSuccess } from '@services/commands';
 import { Source, type Track } from '@shared/types/models';
@@ -83,6 +84,31 @@ describe('remotePlayer store', () => {
 
   it('does not attempt an unguarded proxy swap when the capability is unavailable', () => {
     expect(proxyLocalUrl(8765, undefined, '/tmp/cached.m4a')).not.toContain('/proxy?');
+  });
+
+  it('maps analyser bytes to the shared normalized FFT contract', () => {
+    const byteBins = new Uint8Array(3);
+    const floatBins = new Float32Array(3);
+    const analyser = {
+      getByteFrequencyData: (target: Uint8Array) => target.set([0, 128, 255]),
+    } as Pick<AnalyserNode, 'getByteFrequencyData'>;
+
+    const result = readAnalyserFrame(analyser, byteBins, floatBins, 48_000);
+
+    expect(result.bins).toBe(floatBins);
+    expect(Array.from(result.bins)).toEqual([0, expect.closeTo(128 / 255), 1]);
+    expect(result.sampleRate).toBe(48_000);
+    expect(result.peak).toBe(1);
+  });
+
+  it('rejects mismatched analyser buffers', () => {
+    const analyser = { getByteFrequencyData: vi.fn() } as Pick<AnalyserNode, 'getByteFrequencyData'>;
+    expect(() => readAnalyserFrame(
+      analyser,
+      new Uint8Array(2),
+      new Float32Array(1),
+      48_000,
+    )).toThrow(/Invalid remote FFT analyser buffers/);
   });
 
   it('reports a failed HTMLAudio playback once without changing the fallback behavior', async () => {

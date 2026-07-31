@@ -49,6 +49,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { extractErrorMessage } from '@shared/utils/errors';
 import type { Track, FrequencyData } from '@shared/types/models';
 import { Source } from '@shared/types/models';
+import { reactivityToSmoothing, visualizerReactivity } from './visualizerSettings';
 
 /** The underlying HTMLAudio element for remote playback. */
 let audioEl: HTMLAudioElement | null = null;
@@ -80,6 +81,7 @@ let mediaSource: MediaElementAudioSourceNode | null = null;
 let gainNode: GainNode | null = null;
 /** Analyser node used for frequency-bin extraction. */
 let analyser: AnalyserNode | null = null;
+let stopAnalyserReactivity: (() => void) | null = null;
 /** rAF id for the remote FFT loop (null when not running). */
 let fftRafId: number | null = null;
 /** Reusable byte buffer for analyser.getByteFrequencyData (Uint8Array bins).
@@ -87,6 +89,31 @@ let fftRafId: number | null = null;
 let fftByteBins: Uint8Array<ArrayBuffer> | null = null;
 /** Reusable Float32Array for publishing to the frequencyData store. */
 let fftFloatBins: Float32Array | null = null;
+
+/** Convert one Web Audio analyser read into the same contract as Rust FFT events. */
+export function readAnalyserFrame(
+  source: Pick<AnalyserNode, 'getByteFrequencyData'>,
+  byteBins: Uint8Array<ArrayBuffer>,
+  floatBins: Float32Array,
+  sampleRate: number,
+  target: FrequencyData = { bins: floatBins, sampleRate, peak: 0 },
+): FrequencyData {
+  if (byteBins.length !== floatBins.length || !Number.isFinite(sampleRate) || sampleRate <= 0) {
+    throw new TypeError('Invalid remote FFT analyser buffers');
+  }
+
+  source.getByteFrequencyData(byteBins);
+  let peak = 0;
+  for (let index = 0; index < byteBins.length; index++) {
+    const value = byteBins[index] / 255;
+    floatBins[index] = value;
+    peak = Math.max(peak, value);
+  }
+  target.bins = floatBins;
+  target.sampleRate = sampleRate;
+  target.peak = peak;
+  return target;
+}
 
 /** FFT size for the remote AnalyserNode. Must be a power of two; 1024
  *  matches the Rust FftEngine size used for local playback so the
@@ -133,7 +160,10 @@ function ensureWebAudioChain(el: HTMLAudioElement): void {
   gainNode.gain.value = Math.max(0, Math.min(1, get(volume) / 100));
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = REMOTE_FFT_SIZE;
-  analyser.smoothingTimeConstant = 0.8;
+  stopAnalyserReactivity?.();
+  stopAnalyserReactivity = visualizerReactivity.subscribe((reactivity) => {
+    if (analyser) analyser.smoothingTimeConstant = reactivityToSmoothing(reactivity);
+  });
   mediaSource.connect(gainNode);
   gainNode.connect(analyser);
   analyser.connect(audioCtx.destination);
@@ -148,7 +178,7 @@ function startRemoteFftLoop(): void {
   if (!analyser || !fftByteBins || !fftFloatBins) return;
   if (fftRafId !== null) return; // already running
 
-  const sampleRate = audioCtx?.sampleRate ?? 44100;
+  const frame: FrequencyData = { bins: fftFloatBins, sampleRate: audioCtx?.sampleRate ?? 44100, peak: 0 };
 
   const tick = (): void => {
     if (!analyser || !fftByteBins || !fftFloatBins) {
@@ -157,18 +187,13 @@ function startRemoteFftLoop(): void {
     }
     // getByteFrequencyData returns 0..255 magnitudes. Convert to 0..1
     // floats so the visualizer's existing peak-based normalization works.
-    analyser.getByteFrequencyData(fftByteBins);
-    let peak = 0;
-    for (let i = 0; i < fftByteBins.length; i++) {
-      const v = fftByteBins[i] / 255;
-      fftFloatBins[i] = v;
-      if (v > peak) peak = v;
-    }
-    publishFftFrame('remote', {
-      bins: fftFloatBins,
-      sampleRate,
-      peak,
-    });
+    publishFftFrame('remote', readAnalyserFrame(
+      analyser,
+      fftByteBins,
+      fftFloatBins,
+      audioCtx?.sampleRate ?? 44100,
+      frame,
+    ));
     fftRafId = requestAnimationFrame(tick);
   };
   fftRafId = requestAnimationFrame(tick);
@@ -614,6 +639,13 @@ export function resumeRemote(): void {
       notifications.push({ type: 'error', title: 'Playback Error', message: msg, dismissible: true });
     });
   }
+}
+
+/** Resume remote playback while exposing failure to application-level callers. */
+export async function resumeRemoteOrThrow(): Promise<void> {
+  if (!audioEl || !audioEl.src) throw new Error('No remote playback pipeline');
+  resumeAudioCtx();
+  await audioEl.play();
 }
 
 /** Seek to a position in seconds.
