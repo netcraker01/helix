@@ -19,6 +19,15 @@ def require(text: str, fragment: str, source: str) -> None:
         raise SystemExit(f"{source}: missing required contract: {fragment}")
 
 
+def step(workflow: str, name: str, source: str) -> str:
+    marker = f"      - name: {name}\n"
+    start = workflow.find(marker)
+    if start < 0:
+        raise SystemExit(f"{source}: missing workflow step: {name}")
+    end = workflow.find("      - name: ", start + len(marker))
+    return workflow[start:] if end < 0 else workflow[start:end]
+
+
 for workflow, channel in (
     (release, "linux-appimage"), (release, "linux-deb"), (release, "linux-rpm"),
     (release, "linux-tarball"), (release, "windows-msi"), (release, "windows-nsis"),
@@ -36,6 +45,30 @@ for workflow in (release, windows):
         raise SystemExit("Windows artifacts must not share one baked install channel")
 if "--bundles appimage,deb,rpm" in release:
     raise SystemExit("Linux artifacts must not share one baked install channel")
+
+for workflow, source in ((release, "release.yml"), (windows, "windows.yml")):
+    portable_build = step(workflow, "Build portable executable", source)
+    require(portable_build, "run: cargo tauri build --no-bundle", source)
+    if "cargo build --release" in portable_build:
+        raise SystemExit(f"{source}: portable build must not bypass Tauri")
+
+    require(step(workflow, "Build MSI", source), "run: cargo tauri build --bundles msi", source)
+    require(step(workflow, "Build NSIS", source), "run: cargo tauri build --bundles nsis", source)
+
+    pe_check = step(workflow, "Verify portable PE imports", source)
+    require(pe_check, '$portablePath = "${{ steps.portable.outputs.exe_path }}"', source)
+    require(pe_check, "Test-Path -LiteralPath $portablePath -PathType Leaf", source)
+    require(pe_check, "/nologo /imports $portablePath", source)
+    require(pe_check, "$dumpbinExitCode -ne 0", source)
+    require(pe_check, "[string]::IsNullOrWhiteSpace($importText)", source)
+    require(pe_check, "(?:VCRUNTIME|MSVCP)[^\\s]*\\.dll", source)
+    if not (
+        workflow.index("      - name: Build portable executable")
+        < workflow.index("      - name: Locate portable exe")
+        < workflow.index("      - name: Verify portable PE imports")
+        < workflow.index("      - name: Upload portable exe artifact")
+    ):
+        raise SystemExit(f"{source}: portable build, selection, PE check, and upload are out of order")
 
 require(release, "uses: ./.github/workflows/macos-dmg.yml", "release.yml")
 require(release, "contents: read", "release.yml least-privilege default")

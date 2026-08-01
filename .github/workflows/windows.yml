@@ -130,7 +130,7 @@ jobs:
       - name: Build portable executable
         env:
           JELLYX_INSTALL_CHANNEL: windows-portable
-        run: cargo build --release -p jellyx-desktop
+        run: cargo tauri build --no-bundle
 
       # ---- Locate portable .exe (no installer) ----
       - name: Locate portable exe
@@ -163,6 +163,50 @@ jobs:
           echo "exe_name=$($exeFile.Name)" >> $env:GITHUB_OUTPUT
           echo "sha256_file=$hashFile" >> $env:GITHUB_OUTPUT
           Write-Host "SHA256: $hash"
+
+      - name: Verify portable PE imports
+        shell: pwsh
+        run: |
+          $portablePath = "${{ steps.portable.outputs.exe_path }}"
+          if (-not $portablePath -or -not (Test-Path -LiteralPath $portablePath -PathType Leaf)) {
+            Write-Error "Portable artifact path is missing or is not a file: '$portablePath'"
+            exit 1
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            Write-Error "vswhere.exe is unavailable; cannot inspect portable PE imports"
+            exit 1
+          }
+          $vsInstallPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vsInstallPath) {
+            Write-Error "Visual C++ tools are unavailable; cannot inspect portable PE imports"
+            exit 1
+          }
+          $dumpbin = Get-ChildItem -Path "$vsInstallPath\VC\Tools\MSVC" -Filter "dumpbin.exe" -File -Recurse |
+            Where-Object { $_.FullName -match '\\bin\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Sort-Object -Property FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            Write-Error "dumpbin.exe is unavailable; cannot inspect portable PE imports"
+            exit 1
+          }
+
+          $imports = & $dumpbin.FullName /nologo /imports $portablePath 2>&1
+          $dumpbinExitCode = $LASTEXITCODE
+          $importText = $imports | Out-String
+          if ($dumpbinExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($importText)) {
+            Write-Error "dumpbin failed to inspect the exact portable artifact: $portablePath"
+            exit 1
+          }
+          $forbiddenImports = [regex]::Matches($importText, '(?i)(?:VCRUNTIME|MSVCP)[^\s]*\.dll') |
+            ForEach-Object { $_.Value.ToUpperInvariant() } |
+            Sort-Object -Unique
+          if ($forbiddenImports) {
+            Write-Error "Portable artifact imports forbidden VC runtime DLLs: $($forbiddenImports -join ', ')"
+            exit 1
+          }
+          Write-Host "Portable PE import check passed: $portablePath"
 
       # ---- Locate and process MSI ----
       - name: Locate MSI output
