@@ -606,6 +606,7 @@ jobs:
         env:
           JELLYX_INSTALL_CHANNEL: windows-portable
           JELLYX_SENTRY_DSN: ${{ secrets.JELLYX_SENTRY_DSN }}
+          STATIC_VCRUNTIME: "true"
         run: cargo tauri build --no-bundle
 
       - name: Verify Sentry DSN executable boundary

@@ -130,6 +130,7 @@ jobs:
       - name: Build portable executable
         env:
           JELLYX_INSTALL_CHANNEL: windows-portable
+          STATIC_VCRUNTIME: "true"
         run: cargo tauri build --no-bundle
 
       # ---- Locate portable .exe (no installer) ----

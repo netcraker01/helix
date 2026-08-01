@@ -48,6 +48,7 @@ if "--bundles appimage,deb,rpm" in release:
 
 for workflow, source in ((release, "release.yml"), (windows, "windows.yml")):
     portable_build = step(workflow, "Build portable executable", source)
+    require(portable_build, 'STATIC_VCRUNTIME: "true"', source)
     require(portable_build, "run: cargo tauri build --no-bundle", source)
     if "cargo build --release" in portable_build:
         raise SystemExit(f"{source}: portable build must not bypass Tauri")
