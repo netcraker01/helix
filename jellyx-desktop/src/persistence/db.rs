@@ -16,6 +16,7 @@ use jellyx_engine::sqlite::{
     column_exists as engine_column_exists, table_exists as engine_table_exists, SqliteHandle,
     SqliteOpenError, SqliteOpenStage, SqliteRecoveryError,
 };
+use jellyx_engine::watched_folder::WatchedFolderRepository;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::errors::types::PersistenceError;
@@ -525,93 +526,72 @@ impl Database {
     }
 
     // ── Watched Folders ────────────────────────────────────────────────
+    ///
+    /// All watched-folder CRUD delegates to [`WatchedFolderRepository`]
+    /// in the engine so both frontends share a single persistence boundary.
 
     /// Insert a watched folder. Returns error if path already exists.
     pub fn insert_watched_folder(&self, path: &str) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO watched_folders (path) VALUES (?1)",
-            params![path],
-        )
-        .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint") {
-                PersistenceError::DatabaseError(format!("folder already watched: {}", path))
-            } else {
-                PersistenceError::DatabaseError(format!("failed to insert watched folder: {}", e))
-            }
-        })?;
-
-        Ok(())
+        WatchedFolderRepository::new(self.conn.clone())
+            .add(path)
+            .map_err(|e| {
+                if e.to_string().contains("UNIQUE constraint") {
+                    PersistenceError::DatabaseError(format!("folder already watched: {}", path))
+                } else {
+                    PersistenceError::DatabaseError(format!(
+                        "failed to insert watched folder: {}",
+                        e
+                    ))
+                }
+            })
     }
 
     /// Get all watched folders.
     pub fn get_watched_folders(&self) -> Result<Vec<WatchedFolder>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, last_scanned_at, added_at FROM watched_folders ORDER BY added_at ASC",
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare watched_folders query: {}",
-                    e
-                ))
-            })?;
-
-        let entries = stmt
-            .query_map([], |row| {
-                Ok(WatchedFolder {
-                    path: row.get(0)?,
-                    last_scanned_at: row.get(1)?,
-                    added_at: row.get(2)?,
-                })
-            })
+        WatchedFolderRepository::new(self.conn.clone())
+            .all()
             .map_err(|e| {
                 PersistenceError::DatabaseError(format!("failed to query watched_folders: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
+            })
+            .map(|folders| {
+                folders
+                    .into_iter()
+                    .map(|wf| WatchedFolder {
+                        path: wf.path,
+                        last_scanned_at: wf.last_scanned_at,
+                        added_at: wf.added_at,
+                    })
+                    .collect()
+            })
     }
 
     /// Remove a watched folder. CASCADE deletes associated local_tracks.
     /// Returns true if a row was removed.
     pub fn remove_watched_folder(&self, path: &str) -> Result<bool, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let rows = conn
-            .execute("DELETE FROM watched_folders WHERE path = ?1", params![path])
+        WatchedFolderRepository::new(self.conn.clone())
+            .remove(path)
+            .map(|rows| rows > 0)
             .map_err(|e| {
                 PersistenceError::DatabaseError(format!("failed to remove watched folder: {}", e))
-            })?;
-
-        Ok(rows > 0)
+            })
     }
 
     /// Update the last_scanned_at timestamp for a watched folder.
     pub fn update_folder_scan_time(&self, path: &str) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
+        WatchedFolderRepository::new(self.conn.clone())
+            .update_last_scanned_at(path)
+            .map_err(|e| {
+                PersistenceError::DatabaseError(format!("failed to update scan time: {}", e))
+            })
+    }
 
-        conn.execute(
-            "UPDATE watched_folders SET last_scanned_at = datetime('now') WHERE path = ?1",
-            params![path],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to update folder scan time: {}", e))
-        })?;
-
-        Ok(())
+    /// Check if a watched folder exists.
+    pub fn watched_folder_exists(&self, path: &str) -> Result<bool, PersistenceError> {
+        WatchedFolderRepository::new(self.conn.clone())
+            .exists(path)
+            .map_err(|e| {
+                PersistenceError::DatabaseError(format!("failed to check watched folder: {}", e))
+            })
     }
 
     // ── Local Tracks ──────────────────────────────────────────────────
@@ -932,25 +912,6 @@ impl Database {
             .collect();
 
         Ok(entries)
-    }
-
-    /// Check if a watched folder already exists.
-    pub fn watched_folder_exists(&self, path: &str) -> Result<bool, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM watched_folders WHERE path = ?1",
-                params![path],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to check watched folder: {}", e))
-            })?;
-
-        Ok(count > 0)
     }
 
     // ── Search / Detail Queries ────────────────────────────────────────
