@@ -160,6 +160,157 @@ impl FocusSessionRepository {
         .map_err(|e| e.to_string())
     }
 
+    /// Apply a session mutation atomically.
+    ///
+    /// Returns the existing result if the request_id was already processed (idempotency).
+    /// Checks revision for optimistic concurrency control.
+    pub fn apply_session(
+        &self,
+        request_id: &str,
+        operation_id: &str,
+        operation_kind: &str,
+        expected_revision: Option<i64>,
+        session_json: &str,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+
+        // Idempotency: if request already processed, return existing result
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT result_json FROM focus_operations WHERE request_id = ?1",
+                params![request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(result_json) = existing {
+            return Ok(result_json);
+        }
+
+        // Parse session to check revision
+        let session: serde_json::Value =
+            serde_json::from_str(session_json).map_err(|e| format!("invalid session JSON: {e}"))?;
+        let session_id = session["id"].as_str().ok_or("session missing id")?;
+        let revision = session["revision"]
+            .as_i64()
+            .ok_or("session missing revision")?;
+
+        // Check revision
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM focus_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match (current_revision, expected_revision) {
+            (Some(current), Some(expected)) if current == expected && revision == current + 1 => {}
+            (None, None) if revision == 0 => {}
+            _ => return Err("stale focus revision".into()),
+        }
+
+        // Extract fields from JSON for the INSERT
+        let workflow = session["workflow"].as_str().unwrap_or("pomodoro");
+        let intention = session["intention"].as_str().unwrap_or("");
+        let goal = session["goal"].as_str().unwrap_or("");
+        let first_action = session["first_action"].as_str().unwrap_or("");
+        let cadence = &session["cadence"];
+        let work_duration_ms = cadence["workDurationMs"].as_i64().unwrap_or(25000);
+        let break_duration_ms = cadence["breakDurationMs"].as_i64().unwrap_or(5000);
+        let rounds = cadence["rounds"].as_i64().unwrap_or(4);
+        let round = session["round"].as_i64().unwrap_or(1);
+        let phase = session["phase"].as_str().unwrap_or("work");
+        let state = session["state"].as_str().unwrap_or("active");
+        let phase_started_at = session["phaseStartedAt"].as_i64();
+        let phase_deadline_at = session["phaseDeadlineAt"].as_i64();
+        let paused_remaining_ms = session["pausedRemainingMs"].as_i64();
+
+        // Music strategy
+        let (music_strategy, music_value) = match session["musicStrategy"].as_str() {
+            Some("none") => ("none", None),
+            Some("continueCurrent") => ("continueCurrent", None),
+            Some("preset") => ("preset", session["musicValue"].as_str().map(String::from)),
+            Some("query") => ("query", session["musicValue"].as_str().map(String::from)),
+            _ => ("none", None),
+        };
+
+        let degradation_reason = session["degradation"]
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let outcome = session["outcome"].as_str().map(String::from);
+
+        transaction
+            .execute(
+                "INSERT INTO focus_sessions (
+                    id, intention, goal, first_action, workflow, work_duration_ms,
+                    break_duration_ms, rounds, round, phase, state, phase_started_at,
+                    phase_deadline_at, paused_remaining_ms, revision, music_strategy,
+                    music_value, degradation_reason, outcome, created_at, updated_at, completed_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?20, CASE WHEN ?19 IS NULL THEN NULL ELSE ?20 END
+                 ) ON CONFLICT(id) DO UPDATE SET
+                    intention = excluded.intention, goal = excluded.goal,
+                    first_action = excluded.first_action, workflow = excluded.workflow,
+                    work_duration_ms = excluded.work_duration_ms,
+                    break_duration_ms = excluded.break_duration_ms, rounds = excluded.rounds,
+                    round = excluded.round, phase = excluded.phase, state = excluded.state,
+                    phase_started_at = excluded.phase_started_at,
+                    phase_deadline_at = excluded.phase_deadline_at,
+                    paused_remaining_ms = excluded.paused_remaining_ms,
+                    revision = excluded.revision, music_strategy = excluded.music_strategy,
+                    music_value = excluded.music_value,
+                    degradation_reason = excluded.degradation_reason, outcome = excluded.outcome,
+                    updated_at = excluded.updated_at, completed_at = excluded.completed_at",
+                params![
+                    session_id,
+                    intention,
+                    goal,
+                    first_action,
+                    workflow,
+                    work_duration_ms,
+                    break_duration_ms,
+                    rounds,
+                    round,
+                    phase,
+                    state,
+                    phase_started_at,
+                    phase_deadline_at,
+                    paused_remaining_ms,
+                    revision,
+                    music_strategy,
+                    music_value,
+                    degradation_reason,
+                    outcome,
+                    now_ms,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+        transaction
+            .execute(
+                "INSERT INTO focus_operations
+                    (operation_id, session_id, request_id, operation_kind, result_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    operation_id,
+                    session_id,
+                    request_id,
+                    operation_kind,
+                    session_json,
+                    now_ms
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(session_json.to_string())
+    }
+
     pub fn mark_playback_directive(&self, request_id: &str) -> Result<(), String> {
         let conn = self.db.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -357,6 +508,41 @@ mod tests {
         assert!(!repo.is_playback_directive("req1").unwrap());
         repo.mark_playback_directive("req1").unwrap();
         assert!(repo.is_playback_directive("req1").unwrap());
+    }
+
+    #[test]
+    fn apply_session_inserts_new_session() {
+        let h = fresh_handle();
+        let session = r#"{"id":"s1","intention":"code","goal":"ship","first_action":"write","workflow":"pomodoro","cadence":{"workDurationMs":25000,"breakDurationMs":5000,"rounds":4},"round":1,"phase":"work","state":"active","revision":0,"musicStrategy":"none","captures":[]}"#;
+        let repo = FocusSessionRepository::new(h);
+        let result = repo
+            .apply_session("req1", "op1", "apply", None, session, 1000)
+            .unwrap();
+        assert!(result.contains("s1"));
+        // Second call with same request_id returns same result (idempotent)
+        let result2 = repo
+            .apply_session("req1", "op2", "apply", None, session, 2000)
+            .unwrap();
+        assert_eq!(result, result2);
+    }
+
+    #[test]
+    fn apply_session_rejects_stale_revision() {
+        let h = fresh_handle();
+        // Insert a session at revision 0
+        let conn = h.lock().unwrap();
+        conn.execute(
+            "INSERT INTO focus_sessions (id, intention, goal, first_action, workflow, work_duration_ms, break_duration_ms, rounds, round, phase, state, revision, music_strategy, updated_at) VALUES ('s1', 't', 't', 't', 'pomodoro', 25000, 5000, 4, 1, 'work', 'active', 0, 'none', 1000)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Try to apply with expected_revision=None but session revision=1 (should fail because session exists)
+        let session = r#"{"id":"s1","intention":"t","goal":"t","first_action":"t","workflow":"pomodoro","cadence":{"workDurationMs":25000,"breakDurationMs":5000,"rounds":4},"round":1,"phase":"work","state":"active","revision":1,"musicStrategy":"none","captures":[]}"#;
+        let repo = FocusSessionRepository::new(h);
+        let result = repo.apply_session("req1", "op1", "apply", None, session, 2000);
+        assert!(result.is_err());
     }
 
     #[test]

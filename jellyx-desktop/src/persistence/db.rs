@@ -1270,112 +1270,19 @@ impl Database {
         session: &FocusSession,
         now_ms: i64,
     ) -> Result<FocusSession, PersistenceError> {
-        let mut conn = self.conn.lock().map_err(lock_error)?;
-        let transaction = conn.transaction().map_err(database_error)?;
-        if let Some(result_json) = transaction
-            .query_row(
-                "SELECT result_json FROM focus_operations WHERE request_id = ?1",
-                [request_id],
-                |row| row.get::<_, String>(0),
+        let session_json = serde_json::to_string(session).map_err(serialization_error)?;
+        let repo = FocusSessionRepository::new(self.conn.clone());
+        let result_json = repo
+            .apply_session(
+                request_id,
+                operation_id,
+                operation_kind,
+                expected_revision,
+                &session_json,
+                now_ms,
             )
-            .optional()
-            .map_err(database_error)?
-        {
-            return serde_json::from_str(&result_json).map_err(serialization_error);
-        }
-
-        let current_revision = transaction
-            .query_row(
-                "SELECT revision FROM focus_sessions WHERE id = ?1",
-                [&session.id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        match (current_revision, expected_revision) {
-            (Some(current), Some(expected))
-                if current == expected && session.revision == current + 1 => {}
-            (None, None) if session.revision == 0 => {}
-            _ => {
-                return Err(PersistenceError::WriteError(
-                    "stale focus revision".to_string(),
-                ))
-            }
-        }
-
-        let (music_strategy, music_value) = focus_music_parts(&session.music_strategy);
-        transaction
-            .execute(
-                "INSERT INTO focus_sessions (
-                    id, intention, goal, first_action, workflow, work_duration_ms,
-                    break_duration_ms, rounds, round, phase, state, phase_started_at,
-                    phase_deadline_at, paused_remaining_ms, revision, music_strategy,
-                    music_value, degradation_reason, outcome, created_at, updated_at, completed_at
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?20, CASE WHEN ?19 IS NULL THEN NULL ELSE ?20 END
-                 ) ON CONFLICT(id) DO UPDATE SET
-                    intention = excluded.intention, goal = excluded.goal,
-                    first_action = excluded.first_action, workflow = excluded.workflow,
-                    work_duration_ms = excluded.work_duration_ms,
-                    break_duration_ms = excluded.break_duration_ms, rounds = excluded.rounds,
-                    round = excluded.round, phase = excluded.phase, state = excluded.state,
-                    phase_started_at = excluded.phase_started_at,
-                    phase_deadline_at = excluded.phase_deadline_at,
-                    paused_remaining_ms = excluded.paused_remaining_ms,
-                    revision = excluded.revision, music_strategy = excluded.music_strategy,
-                    music_value = excluded.music_value,
-                    degradation_reason = excluded.degradation_reason, outcome = excluded.outcome,
-                    updated_at = excluded.updated_at, completed_at = excluded.completed_at",
-                params![
-                    session.id,
-                    session.intention,
-                    session.goal,
-                    session.first_action,
-                    focus_name(&session.workflow)?,
-                    session.cadence.work_duration_ms,
-                    session.cadence.break_duration_ms,
-                    session.cadence.rounds,
-                    session.round,
-                    focus_name(&session.phase)?,
-                    focus_name(&session.state)?,
-                    session.phase_started_at,
-                    session.phase_deadline_at,
-                    session.paused_remaining_ms,
-                    session.revision,
-                    music_strategy,
-                    music_value,
-                    session
-                        .degradation
-                        .as_ref()
-                        .map(|value| value.reason.as_str()),
-                    session
-                        .outcome
-                        .map(|value| focus_name(&value))
-                        .transpose()?,
-                    now_ms,
-                ],
-            )
-            .map_err(database_error)?;
-
-        let result_json = serde_json::to_string(session).map_err(serialization_error)?;
-        transaction
-            .execute(
-                "INSERT INTO focus_operations
-                    (operation_id, session_id, request_id, operation_kind, result_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    operation_id,
-                    session.id,
-                    request_id,
-                    operation_kind,
-                    result_json,
-                    now_ms
-                ],
-            )
-            .map_err(database_error)?;
-        transaction.commit().map_err(database_error)?;
-        Ok(session.clone())
+            .map_err(PersistenceError::DatabaseError)?;
+        serde_json::from_str(&result_json).map_err(serialization_error)
     }
 }
 
