@@ -272,93 +272,35 @@ impl Database {
     /// Read the persisted updater prefs. Returns `UpdatePrefs::default()`
     /// (all fields `None`) when no row exists yet (fresh install).
     pub fn get_update_prefs(&self) -> Result<UpdatePrefs, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let result = conn.query_row(
-            "SELECT skipped_version, remind_later_at, last_check_at, detected_channel
-             FROM update_prefs WHERE id = ?1",
-            params![SETTINGS_SINGLETON_ID],
-            |row| {
-                Ok(UpdatePrefs {
-                    skipped_version: row.get(0)?,
-                    remind_later_at: row.get(1)?,
-                    last_check_at: row.get(2)?,
-                    detected_channel: row.get(3)?,
-                })
-            },
-        );
-
-        match result {
-            Ok(prefs) => Ok(prefs),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(UpdatePrefs::default()),
-            Err(e) => Err(PersistenceError::DatabaseError(format!(
-                "failed to read update_prefs: {}",
-                e
-            ))),
-        }
+        use jellyx_engine::updater::UpdatePreferencesRepository;
+        self.engine
+            .update_preferences()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Persist the updater prefs (insert or replace the single row).
     pub fn save_update_prefs(&self, prefs: &UpdatePrefs) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT OR REPLACE INTO update_prefs
-                (id, skipped_version, remind_later_at, last_check_at, detected_channel)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                SETTINGS_SINGLETON_ID,
-                prefs.skipped_version,
-                prefs.remind_later_at,
-                prefs.last_check_at,
-                prefs.detected_channel,
-            ],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to save update_prefs: {}", e))
-        })?;
-
-        Ok(())
+        use jellyx_engine::updater::UpdatePreferencesRepository;
+        self.engine
+            .save_update_preferences(prefs)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Returns false unless the user has explicitly persisted consent.
     pub fn get_telemetry_enabled(&self) -> Result<bool, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-        let enabled = conn.query_row(
-            "SELECT enabled FROM telemetry_prefs WHERE id = ?1",
-            params![SETTINGS_SINGLETON_ID],
-            |row| row.get::<_, i64>(0),
-        );
-        match enabled {
-            Ok(value) => Ok(value != 0),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-            Err(e) => Err(PersistenceError::DatabaseError(format!(
-                "failed to read telemetry preference: {}",
-                e
-            ))),
-        }
+        use jellyx_engine::preferences::PreferencesRepository;
+        self.engine
+            .telemetry_enabled()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Persist the user's explicit telemetry choice. This is never enabled by
     /// migration or by a configured DSN.
     pub fn set_telemetry_enabled(&self, enabled: bool) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-        conn.execute(
-            "INSERT OR REPLACE INTO telemetry_prefs (id, enabled) VALUES (?1, ?2)",
-            params![SETTINGS_SINGLETON_ID, i64::from(enabled)],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to save telemetry preference: {}", e))
-        })?;
-        Ok(())
+        use jellyx_engine::preferences::PreferencesRepository;
+        self.engine
+            .set_telemetry_enabled(enabled)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Record a play event in history.

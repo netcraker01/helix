@@ -1,15 +1,14 @@
 use jellyx_engine::updater::{RepositoryError, UpdatePreferencesRepository, UpdatePrefs};
 
 use super::db::Database;
-use super::preferences::storage_error;
 
 impl UpdatePreferencesRepository for Database {
     fn update_preferences(&self) -> Result<UpdatePrefs, RepositoryError> {
-        self.get_update_prefs().map_err(storage_error)
+        self.engine.update_preferences()
     }
 
     fn save_update_preferences(&self, prefs: &UpdatePrefs) -> Result<(), RepositoryError> {
-        self.save_update_prefs(prefs).map_err(storage_error)
+        self.engine.save_update_preferences(prefs)
     }
 }
 
