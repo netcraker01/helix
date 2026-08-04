@@ -12,6 +12,7 @@ pub mod migrations;
 pub mod preferences;
 pub mod sqlite;
 pub mod updater;
+pub mod user_playlists;
 pub mod watched_folder;
 
 pub use sqlite::{SqliteIntegrityClassification, SqliteRecoveryError};

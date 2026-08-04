@@ -17,6 +17,7 @@ use jellyx_engine::sqlite::{
     column_exists as engine_column_exists, table_exists as engine_table_exists, SqliteHandle,
     SqliteOpenError, SqliteOpenStage, SqliteRecoveryError,
 };
+use jellyx_engine::user_playlists::UserPlaylistsRepository;
 use jellyx_engine::watched_folder::WatchedFolderRepository;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -62,26 +63,6 @@ const SETTINGS_SINGLETON_ID: i64 = 1;
 
 /// Default history query limit.
 const HISTORY_LIMIT: u32 = 100;
-
-/// Column list for `user_playlists` SELECT statements, kept in sync with
-/// [`row_to_playlist`]. Used by every playlist-reading query so the column
-/// set is consistent across methods.
-const PLAYLIST_COLUMNS: &str =
-    "id, title, kind, source_folder_path, parent_playlist_id, created_at, updated_at";
-
-/// Map a `user_playlists` row into a [`UserPlaylist`]. Column order MUST match
-/// [`PLAYLIST_COLUMNS`].
-fn row_to_playlist(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserPlaylist> {
-    Ok(UserPlaylist {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        kind: row.get(2)?,
-        source_folder_path: row.get(3)?,
-        parent_playlist_id: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
 
 /// SQLite-backed database for Jellyx library data.
 ///
@@ -846,21 +827,32 @@ impl Database {
     }
 
     // ── User Playlists ─────────────────────────────────────────────────
-
-    /// Create a new user playlist.
     ///
-    /// `kind` defaults to `"manual"` for user-created playlists. Pass
-    /// `"folder"` for folder-derived playlists.
+    /// All user-playlist CRUD delegates to [`UserPlaylistsRepository`]
+    /// in the engine so both frontends share a single persistence boundary.
+
+    fn engine_playlist_to_desktop(p: jellyx_engine::user_playlists::UserPlaylist) -> UserPlaylist {
+        UserPlaylist {
+            id: p.id,
+            title: p.title,
+            kind: p.kind,
+            source_folder_path: p.source_folder_path,
+            parent_playlist_id: p.parent_playlist_id,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+        }
+    }
+
+    /// Create a new manual playlist.
     pub fn create_playlist(&self, title: &str) -> Result<UserPlaylist, PersistenceError> {
-        self.create_playlist_with_kind(title, "manual")
+        UserPlaylistsRepository::new(self.conn.clone())
+            .create(title)
+            .map(Self::engine_playlist_to_desktop)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Create a new user playlist with an explicit kind and optional source
     /// folder + parent linkage.
-    ///
-    /// `kind` is `"manual"`, `"folder"` or `"generated_artist"`. For folder
-    /// playlists pass `source_folder_path = Some(watched_path)` and
-    /// `parent_playlist_id = Some(parent_id)` for child playlists.
     pub fn create_folder_playlist(
         &self,
         title: &str,
@@ -868,318 +860,109 @@ impl Database {
         source_folder_path: Option<&str>,
         parent_playlist_id: Option<&str>,
     ) -> Result<UserPlaylist, PersistenceError> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO user_playlists (id, title, kind, source_folder_path, parent_playlist_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, title, kind, source_folder_path, parent_playlist_id],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to create playlist: {}", e))
-        })?;
-
-        Ok(UserPlaylist {
-            id,
-            title: title.to_string(),
-            kind: kind.to_string(),
-            source_folder_path: source_folder_path.map(|s| s.to_string()),
-            parent_playlist_id: parent_playlist_id.map(|s| s.to_string()),
-            created_at: Self::now_iso(&conn),
-            updated_at: Self::now_iso(&conn),
-        })
-    }
-
-    /// Internal helper: create a manual playlist.
-    fn create_playlist_with_kind(
-        &self,
-        title: &str,
-        kind: &str,
-    ) -> Result<UserPlaylist, PersistenceError> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO user_playlists (id, title, kind) VALUES (?1, ?2, ?3)",
-            params![id, title, kind],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to create playlist: {}", e))
-        })?;
-
-        Ok(UserPlaylist {
-            id,
-            title: title.to_string(),
-            kind: kind.to_string(),
-            source_folder_path: None,
-            parent_playlist_id: None,
-            created_at: Self::now_iso(&conn),
-            updated_at: Self::now_iso(&conn),
-        })
-    }
-
-    fn now_iso(conn: &Connection) -> String {
-        conn.query_row("SELECT datetime('now')", [], |row| row.get(0))
-            .unwrap_or_default()
+        UserPlaylistsRepository::new(self.conn.clone())
+            .create_folder(title, kind, source_folder_path, parent_playlist_id)
+            .map(Self::engine_playlist_to_desktop)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Rename a user playlist.
     pub fn rename_playlist(&self, id: &str, title: &str) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let rows = conn
-            .execute(
-                "UPDATE user_playlists SET title = ?1, updated_at = datetime('now') WHERE id = ?2",
-                params![title, id],
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to rename playlist: {}", e))
-            })?;
-
-        if rows == 0 {
-            return Err(PersistenceError::DatabaseError(format!(
-                "playlist not found: {}",
-                id
-            )));
-        }
-
-        Ok(())
+        UserPlaylistsRepository::new(self.conn.clone())
+            .rename(id, title)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Delete a user playlist (cascades to playlist_tracks).
     pub fn delete_playlist(&self, id: &str) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let rows = conn
-            .execute("DELETE FROM user_playlists WHERE id = ?1", params![id])
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to delete playlist: {}", e))
-            })?;
-
-        if rows == 0 {
-            return Err(PersistenceError::DatabaseError(format!(
-                "playlist not found: {}",
-                id
-            )));
-        }
-
-        Ok(())
+        UserPlaylistsRepository::new(self.conn.clone())
+            .delete(id)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get all user playlists, ordered by updated_at DESC.
     pub fn get_all_playlists(&self) -> Result<Vec<UserPlaylist>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM user_playlists ORDER BY updated_at DESC",
-                PLAYLIST_COLUMNS
-            ))
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to prepare playlists query: {}", e))
-            })?;
-
-        let playlists = stmt
-            .query_map([], row_to_playlist)
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query playlists: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(playlists)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .get_all()
+            .map(|v| {
+                v.into_iter()
+                    .map(Self::engine_playlist_to_desktop)
+                    .collect()
+            })
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get a single user playlist by ID.
     #[allow(dead_code)]
     pub fn get_playlist(&self, id: &str) -> Result<UserPlaylist, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.query_row(
-            &format!(
-                "SELECT {} FROM user_playlists WHERE id = ?1",
-                PLAYLIST_COLUMNS
-            ),
-            params![id],
-            row_to_playlist,
-        )
-        .map_err(|e| PersistenceError::DatabaseError(format!("failed to get playlist: {}", e)))
+        UserPlaylistsRepository::new(self.conn.clone())
+            .get_by_id(id)
+            .map(Self::engine_playlist_to_desktop)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get recent playlists, ordered by updated_at DESC.
     pub fn get_recent_playlists(&self, limit: u32) -> Result<Vec<UserPlaylist>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM user_playlists ORDER BY updated_at DESC LIMIT ?1",
-                PLAYLIST_COLUMNS
-            ))
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare recent playlists query: {}",
-                    e
-                ))
-            })?;
-
-        let playlists = stmt
-            .query_map(params![limit], row_to_playlist)
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query recent playlists: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(playlists)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .get_recent(limit)
+            .map(|v| {
+                v.into_iter()
+                    .map(Self::engine_playlist_to_desktop)
+                    .collect()
+            })
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Search playlists by title (LIKE query).
     pub fn search_playlists(&self, query: &str) -> Result<Vec<UserPlaylist>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let pattern = format!("%{}%", query);
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM user_playlists WHERE title LIKE ?1 ORDER BY updated_at DESC",
-                PLAYLIST_COLUMNS
-            ))
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare search playlists query: {}",
-                    e
-                ))
-            })?;
-
-        let playlists = stmt
-            .query_map(params![pattern], row_to_playlist)
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to search playlists: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(playlists)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .search(query)
+            .map(|v| {
+                v.into_iter()
+                    .map(Self::engine_playlist_to_desktop)
+                    .collect()
+            })
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get all playlists generated from a watched folder (parent + children).
-    ///
-    /// Used by folder-as-playlist generation to detect existing playlists
-    /// (idempotency) and by cascade delete to clean up on folder removal.
     pub fn get_playlists_by_source_folder(
         &self,
         folder_path: &str,
     ) -> Result<Vec<UserPlaylist>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM user_playlists WHERE source_folder_path = ?1 ORDER BY COALESCE(parent_playlist_id, ''), title ASC",
-                PLAYLIST_COLUMNS
-            ))
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare playlists_by_source_folder query: {}",
-                    e
-                ))
-            })?;
-
-        let playlists = stmt
-            .query_map(params![folder_path], row_to_playlist)
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to query playlists by source folder: {}",
-                    e
-                ))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(playlists)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .get_by_source_folder(folder_path)
+            .map(|v| {
+                v.into_iter()
+                    .map(Self::engine_playlist_to_desktop)
+                    .collect()
+            })
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get all child playlists of a given parent playlist.
-    ///
-    /// Returns playlists whose `parent_playlist_id` equals `parent_id`,
-    /// ordered by title. Used by the playlist detail view to render child
-    /// playlists under their parent.
     pub fn get_child_playlists(
         &self,
         parent_id: &str,
     ) -> Result<Vec<UserPlaylist>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM user_playlists WHERE parent_playlist_id = ?1 ORDER BY title ASC",
-                PLAYLIST_COLUMNS
-            ))
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare child_playlists query: {}",
-                    e
-                ))
-            })?;
-
-        let playlists = stmt
-            .query_map(params![parent_id], row_to_playlist)
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query child playlists: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(playlists)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .get_child_playlists(parent_id)
+            .map(|v| {
+                v.into_iter()
+                    .map(Self::engine_playlist_to_desktop)
+                    .collect()
+            })
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Delete all playlists generated from a watched folder.
-    ///
-    /// Called by the scanner when a watched folder is removed so that the
-    /// folder's parent and child playlists are cascade-deleted. Manual
-    /// playlists (no `source_folder_path`) are preserved.
     pub fn delete_playlists_by_source_folder(
         &self,
         folder_path: &str,
     ) -> Result<u64, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let rows = conn
-            .execute(
-                "DELETE FROM user_playlists WHERE source_folder_path = ?1",
-                params![folder_path],
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to delete playlists by source folder: {}",
-                    e
-                ))
-            })?;
-
-        Ok(rows as u64)
+        UserPlaylistsRepository::new(self.conn.clone())
+            .delete_by_source_folder(folder_path)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Add a track to the end of a playlist.
