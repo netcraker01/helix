@@ -9,6 +9,7 @@ pub const BOUNDARY_ESTABLISHED: bool = true;
 pub mod local_track;
 pub mod migration_lock;
 pub mod migrations;
+pub mod playlist_tracks;
 pub mod preferences;
 pub mod sqlite;
 pub mod updater;

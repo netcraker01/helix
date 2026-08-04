@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::migrations as engine_migrations;
+use jellyx_engine::playlist_tracks::PlaylistTracksRepository;
 use jellyx_engine::sqlite::{
     column_exists as engine_column_exists, table_exists as engine_table_exists, SqliteHandle,
     SqliteOpenError, SqliteOpenStage, SqliteRecoveryError,
@@ -974,43 +975,20 @@ impl Database {
         let track_json = serde_json::to_string(track).map_err(|e| {
             PersistenceError::WriteError(format!("failed to serialize track: {}", e))
         })?;
-
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        // Find max position
-        let max_pos: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(position) FROM playlist_tracks WHERE playlist_id = ?1",
-                params![playlist_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
-        let position = max_pos.unwrap_or(-1) + 1;
-
-        conn.execute(
-            "INSERT INTO playlist_tracks (playlist_id, position, track_json) VALUES (?1, ?2, ?3)",
-            params![playlist_id, position, track_json],
-        )
-        .map_err(|e| {
-            if e.to_string().contains("FOREIGN KEY") {
-                PersistenceError::DatabaseError(format!("playlist not found: {}", playlist_id))
-            } else {
-                PersistenceError::DatabaseError(format!("failed to add track to playlist: {}", e))
-            }
-        })?;
-
-        // Update playlist updated_at
-        conn.execute(
-            "UPDATE user_playlists SET updated_at = datetime('now') WHERE id = ?1",
-            params![playlist_id],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to update playlist timestamp: {}", e))
-        })?;
-
-        Ok(())
+        PlaylistTracksRepository::new(self.conn.clone())
+            .add_track(playlist_id, &track_json)
+            .map_err(|e| {
+                if e.to_string().contains("FOREIGN KEY")
+                    || e == rusqlite::Error::QueryReturnedNoRows
+                {
+                    PersistenceError::DatabaseError(format!("playlist not found: {}", playlist_id))
+                } else {
+                    PersistenceError::DatabaseError(format!(
+                        "failed to add track to playlist: {}",
+                        e
+                    ))
+                }
+            })
     }
 
     /// Remove all tracks from a playlist, resetting it to empty.
@@ -1020,19 +998,9 @@ impl Database {
     /// playlists are never wiped by this helper — callers are responsible
     /// for only invoking it on `kind = 'folder'` playlists.
     pub fn clear_playlist_tracks(&self, playlist_id: &str) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
-            params![playlist_id],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to clear playlist tracks: {}", e))
-        })?;
-
-        Ok(())
+        PlaylistTracksRepository::new(self.conn.clone())
+            .clear_tracks(playlist_id)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Remove a track from a playlist by position and reindex remaining positions.
@@ -1041,33 +1009,9 @@ impl Database {
         playlist_id: &str,
         position: i64,
     ) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "DELETE FROM playlist_tracks WHERE playlist_id = ?1 AND position = ?2",
-            params![playlist_id, position],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to remove track from playlist: {}", e))
-        })?;
-
-        // Reindex positions
-        conn.execute(
-            "UPDATE playlist_tracks SET position = (
-                SELECT rn FROM (
-                    SELECT position, ROW_NUMBER() OVER (ORDER BY position ASC) - 1 AS rn
-                    FROM playlist_tracks WHERE playlist_id = ?1
-                ) sub WHERE sub.position = playlist_tracks.position
-            ) WHERE playlist_id = ?1",
-            params![playlist_id],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to reindex playlist tracks: {}", e))
-        })?;
-
-        Ok(())
+        PlaylistTracksRepository::new(self.conn.clone())
+            .remove_track(playlist_id, position)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get all tracks in a playlist, ordered by position.
@@ -1075,45 +1019,22 @@ impl Database {
         &self,
         playlist_id: &str,
     ) -> Result<Vec<PlaylistTrackEntry>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT playlist_id, position, track_json, added_at FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC",
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare playlist tracks query: {}",
-                    e
-                ))
-            })?;
-
-        let entries = stmt
-            .query_map(params![playlist_id], |row| {
-                let track_json: String = row.get(2)?;
-                let track: Track = serde_json::from_str(&track_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        track_json.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+        PlaylistTracksRepository::new(self.conn.clone())
+            .get_tracks(playlist_id)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?
+            .into_iter()
+            .map(|row| {
+                let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
+                    PersistenceError::DatabaseError(format!("failed to deserialize track: {}", e))
                 })?;
                 Ok(PlaylistTrackEntry {
-                    playlist_id: row.get(0)?,
-                    position: row.get(1)?,
+                    playlist_id: row.playlist_id,
+                    position: row.position,
                     track,
-                    added_at: row.get(3)?,
+                    added_at: row.added_at,
                 })
             })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query playlist tracks: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
+            .collect()
     }
 
     /// Get up to 4 thumbnail URLs from the first tracks in a playlist that have thumbnails.
@@ -1124,69 +1045,16 @@ impl Database {
         &self,
         playlist_id: &str,
     ) -> Result<Vec<String>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT track_json FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position ASC",
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare playlist thumbnails query: {}",
-                    e
-                ))
-            })?;
-
-        let mut thumbnails: Vec<String> = Vec::new();
-        let rows = stmt
-            .query_map(params![playlist_id], |row| {
-                let track_json: String = row.get(0)?;
-                Ok(track_json)
-            })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to query playlist thumbnails: {}",
-                    e
-                ))
-            })?;
-
-        for row_result in rows {
-            if thumbnails.len() >= 4 {
-                break;
-            }
-            if let Ok(track_json) = row_result {
-                if let Ok(track) = serde_json::from_str::<Track>(&track_json) {
-                    if let Some(thumb) = track.thumbnail {
-                        if !thumb.is_empty() {
-                            thumbnails.push(thumb);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(thumbnails)
+        PlaylistTracksRepository::new(self.conn.clone())
+            .get_thumbnails(playlist_id)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Count tracks in a playlist.
     pub fn count_playlist_tracks(&self, playlist_id: &str) -> Result<u32, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?1",
-                params![playlist_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to count playlist tracks: {}", e))
-            })?;
-
-        Ok(count)
+        PlaylistTracksRepository::new(self.conn.clone())
+            .count_tracks(playlist_id)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     // ── Artist Favorites ────────────────────────────────────────────────
