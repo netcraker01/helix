@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use jellyx_engine::artist_favorites::ArtistFavoritesRepository;
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::migrations as engine_migrations;
 use jellyx_engine::playlist_tracks::PlaylistTracksRepository;
@@ -1073,21 +1074,9 @@ impl Database {
         thumbnail: Option<&str>,
         source_artist_ref: Option<&str>,
     ) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO artist_favorites (artist_id, source, artist_name, thumbnail, source_artist_ref)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(artist_id, source) DO NOTHING",
-            params![artist_id, source, artist_name, thumbnail, source_artist_ref],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to add artist favorite: {}", e))
-        })?;
-
-        Ok(())
+        ArtistFavoritesRepository::new(self.conn.clone())
+            .add(artist_id, source, artist_name, thumbnail, source_artist_ref)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Remove an artist from favorites.
@@ -1099,25 +1088,9 @@ impl Database {
         artist_id: &str,
         source: Option<&str>,
     ) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        match source {
-            Some(src) => conn.execute(
-                "DELETE FROM artist_favorites WHERE artist_id = ?1 AND source = ?2",
-                params![artist_id, src],
-            ),
-            None => conn.execute(
-                "DELETE FROM artist_favorites WHERE artist_id = ?1",
-                params![artist_id],
-            ),
-        }
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to remove artist favorite: {}", e))
-        })?;
-
-        Ok(())
+        ArtistFavoritesRepository::new(self.conn.clone())
+            .remove(artist_id, source)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Check if an artist is favorited.
@@ -1130,62 +1103,28 @@ impl Database {
         artist_id: &str,
         source: Option<&str>,
     ) -> Result<bool, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let count: u32 = match source {
-            Some(src) => conn.query_row(
-                "SELECT COUNT(*) FROM artist_favorites WHERE artist_id = ?1 AND source = ?2",
-                params![artist_id, src],
-                |row| row.get(0),
-            ),
-            None => conn.query_row(
-                "SELECT COUNT(*) FROM artist_favorites WHERE artist_id = ?1",
-                params![artist_id],
-                |row| row.get(0),
-            ),
-        }
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to check artist favorite: {}", e))
-        })?;
-
-        Ok(count > 0)
+        ArtistFavoritesRepository::new(self.conn.clone())
+            .is_favorite(artist_id, source)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get all favorited artists, ordered by added_at DESC.
     pub fn get_all_artist_favorites(&self) -> Result<Vec<ArtistFavorite>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare("SELECT artist_id, source, artist_name, thumbnail, source_artist_ref, added_at FROM artist_favorites ORDER BY added_at DESC")
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare artist favorites query: {}",
-                    e
-                ))
-            })?;
-
-        let entries = stmt
-            .query_map([], |row| {
-                Ok(ArtistFavorite {
-                    artist_id: row.get(0)?,
-                    source: row.get(1)?,
-                    artist_name: row.get(2)?,
-                    thumbnail: row.get(3)?,
-                    source_artist_ref: row.get(4)?,
-                    added_at: row.get(5)?,
-                })
+        ArtistFavoritesRepository::new(self.conn.clone())
+            .get_all()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| ArtistFavorite {
+                        artist_id: row.artist_id,
+                        source: row.source,
+                        artist_name: row.artist_name,
+                        thumbnail: row.thumbnail,
+                        source_artist_ref: row.source_artist_ref,
+                        added_at: row.added_at,
+                    })
+                    .collect()
             })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query artist favorites: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
     }
 
     // ── Audio Settings ────────────────────────────────────────────────
