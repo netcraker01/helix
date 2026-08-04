@@ -11,7 +11,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use jellyx_engine::migrations as engine_migrations;
 use jellyx_engine::sqlite::{
     column_exists as engine_column_exists, table_exists as engine_table_exists, SqliteHandle,
     SqliteOpenError, SqliteOpenStage, SqliteRecoveryError,
@@ -32,10 +31,6 @@ use jellyx_core::models::track::Track;
 
 /// Current schema version — increment when adding migrations.
 const SCHEMA_VERSION: u32 = 10;
-const SCHEMA_VERSION_V6: u32 = 6;
-const SCHEMA_VERSION_V7: u32 = 7;
-const SCHEMA_VERSION_V8: u32 = 8;
-const SCHEMA_VERSION_V10: u32 = 10;
 /// Singleton row key for settings tables that intentionally contain one row.
 const SETTINGS_SINGLETON_ID: i64 = 1;
 
@@ -125,140 +120,15 @@ impl Database {
         })
     }
 
-    /// Apply incremental schema migrations up to [`SCHEMA_VERSION`].
+    /// Apply incremental schema migrations up to the engine's target
+    /// `SCHEMA_VERSION`.
     ///
-    /// Reads the current version from `_meta` and runs the migration steps
-    /// for every version greater than the stored one. Each step is idempotent
-    /// so re-running on an already-migrated database is a no-op.
-    ///
-    /// Migrations use `ALTER TABLE ... ADD COLUMN` (which errors if the
-    /// column already exists, so we wrap them in a tolerance check) and, for
-    /// the `artist_favorites` PK change, a full table rebuild.
+    /// Delegates to [`SqliteHandle::run_migrations`] in the engine, which owns
+    /// the version-reading, prerequisite-checking, and step-ordering logic.
+    /// The desktop no longer duplicates the dispatch or migration SQL bodies.
     fn run_migrations(&self) -> Result<(), PersistenceError> {
-        let current = {
-            let conn = self.conn.lock().map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-            })?;
-
-            let current: u32 = conn
-                .query_row(
-                    "SELECT value FROM _meta WHERE key = 'schema_version'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-
-            let needs_v6 = current < SCHEMA_VERSION_V6
-                || !Self::column_exists(&conn, "local_tracks", "subfolder_path")
-                || !Self::column_exists(&conn, "user_playlists", "kind")
-                || !Self::column_exists(&conn, "user_playlists", "source_folder_path")
-                || !Self::column_exists(&conn, "user_playlists", "parent_playlist_id")
-                || !Self::column_exists(&conn, "artist_favorites", "source")
-                || !Self::column_exists(&conn, "artist_favorites", "source_artist_ref");
-
-            let needs_v7 =
-                current < SCHEMA_VERSION_V7 || !Self::table_exists(&conn, "update_prefs");
-            let needs_v8 =
-                current < SCHEMA_VERSION_V8 || !Self::table_exists(&conn, "telemetry_prefs");
-            let needs_v10 = current < SCHEMA_VERSION_V10
-                || !Self::table_exists(&conn, "focus_sessions")
-                || !Self::table_exists(&conn, "focus_captures")
-                || !Self::table_exists(&conn, "focus_preferences")
-                || !Self::table_exists(&conn, "focus_operations")
-                || !Self::column_exists(&conn, "focus_sessions", "goal")
-                || !Self::column_exists(&conn, "focus_sessions", "first_action");
-
-            if current >= SCHEMA_VERSION && !needs_v6 && !needs_v7 && !needs_v8 && !needs_v10 {
-                return Ok(());
-            }
-
-            (current, needs_v6, needs_v7, needs_v8, needs_v10)
-        };
-
-        let (_, needs_v6, needs_v7, needs_v8, needs_v10) = current;
-
-        // v5 → v6: subfolder_path on local_tracks, folder/parent/kind on
-        // user_playlists, composite PK + source columns on artist_favorites.
-        if needs_v6 {
-            self.run_migration_step(SCHEMA_VERSION_V6, Self::migrate_to_v6)?;
-        }
-
-        // v6 → v7: add the `update_prefs` table for the channel-aware updater.
-        // Idempotent: only creates the table if it doesn't already exist.
-        if needs_v7 {
-            self.run_migration_step(SCHEMA_VERSION_V7, Self::migrate_to_v7)?;
-        }
-
-        // v7 → v8: persist an explicit, default-off remote telemetry choice.
-        if needs_v8 {
-            self.run_migration_step(SCHEMA_VERSION_V8, Self::migrate_to_v8)?;
-        }
-
-        if needs_v10 {
-            self.run_migration_step(SCHEMA_VERSION_V10, Self::migrate_to_v10)?;
-        }
-
-        Ok(())
-    }
-
-    /// Atomically execute one migration step under `BEGIN IMMEDIATE`.
-    ///
-    /// Delegates to [`SqliteHandle::run_migration_step`] in the engine, which
-    /// owns the transaction mechanics: BEGIN IMMEDIATE, callback execution,
-    /// monotonic `schema_version` update, commit on success, rollback on
-    /// failure. Migration SQL bodies remain desktop-owned (Units 3D7+).
-    fn run_migration_step(
-        &self,
-        version: u32,
-        migrate: fn(&Connection) -> Result<(), PersistenceError>,
-    ) -> Result<(), PersistenceError> {
-        self.conn.run_migration_step(version, |tx| migrate(tx))
-    }
-
-    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-        engine_column_exists(conn, table, column).unwrap_or(false)
-    }
-
-    fn table_exists(conn: &Connection, table: &str) -> bool {
-        engine_table_exists(conn, table).unwrap_or(false)
-    }
-
-    /// v5 → v6 migration.
-    ///
-    /// Delegates the SQL body to [`engine_migrations::migrate_to_v6`], which
-    /// the engine owns so the migration logic is shared with future Tauri-free
-    /// frontends. This wrapper preserves the desktop `PersistenceError`
-    /// mapping; the engine returns a context-carrying `MigrationError` whose
-    /// string form matches the historical desktop error messages.
-    fn migrate_to_v6(conn: &Connection) -> Result<(), PersistenceError> {
-        engine_migrations::migrate_to_v6(conn)
-            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
-    }
-
-    /// v6 → v7 migration.
-    ///
-    /// Delegates the SQL body to [`engine_migrations::migrate_to_v7`].
-    fn migrate_to_v7(conn: &Connection) -> Result<(), PersistenceError> {
-        engine_migrations::migrate_to_v7(conn)
-            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
-    }
-
-    /// v7 → v8 migration. No row is seeded, so consent is false until the
-    /// user actively enables it in Settings.
-    ///
-    /// Delegates the SQL body to [`engine_migrations::migrate_to_v8`].
-    fn migrate_to_v8(conn: &Connection) -> Result<(), PersistenceError> {
-        engine_migrations::migrate_to_v8(conn)
-            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
-    }
-
-    /// v8 → v10 migration.
-    ///
-    /// Delegates the SQL body to [`engine_migrations::migrate_to_v10`].
-    fn migrate_to_v10(conn: &Connection) -> Result<(), PersistenceError> {
-        engine_migrations::migrate_to_v10(conn)
+        self.conn
+            .run_migrations()
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
@@ -2546,12 +2416,8 @@ mod tests {
         assert!(message.contains("failed to rebuild artist_favorites for v6"));
 
         let conn = Connection::open(&path).unwrap();
-        assert!(!Database::column_exists(
-            &conn,
-            "local_tracks",
-            "subfolder_path"
-        ));
-        assert!(!Database::column_exists(&conn, "user_playlists", "kind"));
+        assert!(!engine_column_exists(&conn, "local_tracks", "subfolder_path").unwrap());
+        assert!(!engine_column_exists(&conn, "user_playlists", "kind").unwrap());
         assert_eq!(
             conn.query_row(
                 "SELECT artist_name FROM artist_favorites WHERE artist_id = 'artist-1'",
@@ -2577,12 +2443,8 @@ mod tests {
         let db = Database::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         let conn = db.conn.lock().unwrap();
-        assert!(Database::column_exists(
-            &conn,
-            "local_tracks",
-            "subfolder_path"
-        ));
-        assert!(Database::column_exists(&conn, "user_playlists", "kind"));
+        assert!(engine_column_exists(&conn, "local_tracks", "subfolder_path").unwrap());
+        assert!(engine_column_exists(&conn, "user_playlists", "kind").unwrap());
         assert_eq!(
             conn.query_row(
                 "SELECT source FROM artist_favorites WHERE artist_id = 'artist-1'",
@@ -2636,14 +2498,13 @@ mod tests {
             "focus_preferences",
             "focus_operations",
         ] {
-            assert!(Database::table_exists(&conn, table), "missing {table}");
+            assert!(
+                engine_table_exists(&conn, table).unwrap(),
+                "missing {table}"
+            );
         }
-        assert!(Database::column_exists(&conn, "focus_sessions", "goal"));
-        assert!(Database::column_exists(
-            &conn,
-            "focus_sessions",
-            "first_action"
-        ));
+        assert!(engine_column_exists(&conn, "focus_sessions", "goal").unwrap());
+        assert!(engine_column_exists(&conn, "focus_sessions", "first_action").unwrap());
         drop(conn);
 
         let first = sample_focus_session("focus-1");
@@ -2770,13 +2631,9 @@ mod tests {
             .unwrap();
 
         let conn = db.conn.lock().unwrap();
-        assert!(Database::column_exists(&conn, "user_playlists", "kind"));
-        assert!(Database::column_exists(&conn, "artist_favorites", "source"));
-        assert!(Database::column_exists(
-            &conn,
-            "artist_favorites",
-            "source_artist_ref"
-        ));
+        assert!(engine_column_exists(&conn, "user_playlists", "kind").unwrap());
+        assert!(engine_column_exists(&conn, "artist_favorites", "source").unwrap());
+        assert!(engine_column_exists(&conn, "artist_favorites", "source_artist_ref").unwrap());
         drop(conn);
 
         let _ = std::fs::remove_file(path);
@@ -2862,11 +2719,7 @@ mod tests {
         .unwrap();
 
         let conn = db.conn.lock().unwrap();
-        assert!(Database::column_exists(
-            &conn,
-            "artist_favorites",
-            "source_artist_ref"
-        ));
+        assert!(engine_column_exists(&conn, "artist_favorites", "source_artist_ref").unwrap());
         drop(conn);
 
         let _ = std::fs::remove_file(path);
