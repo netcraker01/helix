@@ -15,6 +15,7 @@ use jellyx_engine::artist_favorites::ArtistFavoritesRepository;
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::migrations as engine_migrations;
 use jellyx_engine::playlist_tracks::PlaylistTracksRepository;
+use jellyx_engine::settings::SettingsRepository;
 use jellyx_engine::sqlite::{
     column_exists as engine_column_exists, table_exists as engine_table_exists, SqliteHandle,
     SqliteOpenError, SqliteOpenStage, SqliteRecoveryError,
@@ -1132,43 +1133,16 @@ impl Database {
     /// Get whether audio normalization is enabled.
     /// Defaults to true (enabled).
     pub fn get_normalize_audio(&self) -> Result<bool, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let result = conn.query_row(
-            "SELECT value FROM audio_settings WHERE key = 'normalize_audio'",
-            [],
-            |row| row.get::<_, String>(0),
-        );
-
-        match result {
-            Ok(val) => Ok(val == "1" || val == "true"),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(true), // default: enabled
-            Err(e) => Err(PersistenceError::DatabaseError(format!(
-                "failed to get normalize_audio: {}",
-                e
-            ))),
-        }
+        let repo = SettingsRepository::new(self.conn.clone());
+        repo.get_normalize_audio()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Set whether audio normalization is enabled.
     pub fn set_normalize_audio(&self, enabled: bool) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let val = if enabled { "1" } else { "0" };
-        conn.execute(
-            "INSERT INTO audio_settings (key, value) VALUES ('normalize_audio', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = ?1",
-            params![val],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to set normalize_audio: {}", e))
-        })?;
-
-        Ok(())
+        let repo = SettingsRepository::new(self.conn.clone());
+        repo.set_normalize_audio(enabled)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     // ── Source Settings ────────────────────────────────────────────────
@@ -1178,84 +1152,32 @@ impl Database {
     /// Returns entries for YouTube, SoundCloud, and Local, defaulting to
     /// enabled if not yet stored in the database.
     pub fn get_source_settings(&self) -> Result<Vec<SourceSetting>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        // Ensure defaults exist for all known sources
-        for source in &["YouTube", "SoundCloud"] {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM source_settings WHERE source = ?1",
-                    params![source],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|c| c > 0)
-                .unwrap_or(false);
-
-            if !exists {
-                conn.execute(
-                    "INSERT INTO source_settings (source, enabled) VALUES (?1, 1)",
-                    params![source],
-                )
-                .map_err(|e| {
-                    PersistenceError::DatabaseError(format!(
-                        "failed to insert default source setting: {}",
-                        e
-                    ))
-                })?;
-            }
-        }
-
-        let mut stmt = conn
-            .prepare("SELECT source, enabled FROM source_settings ORDER BY source")
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare source settings query: {}",
-                    e
-                ))
-            })?;
-
-        let entries: Vec<SourceSetting> = stmt
-            .query_map([], |row| {
-                let source: String = row.get(0)?;
-                let enabled: bool = row.get::<_, i64>(1)? != 0;
-                let label = match source.as_str() {
+        let repo = SettingsRepository::new(self.conn.clone());
+        let rows = repo
+            .get_source_settings()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let label = match r.source.as_str() {
                     "YouTube" => "YouTube".to_string(),
                     "SoundCloud" => "SoundCloud".to_string(),
                     other => other.to_string(),
                 };
-                Ok(SourceSetting {
-                    source,
-                    enabled,
+                SourceSetting {
+                    source: r.source,
+                    enabled: r.enabled,
                     label,
-                })
+                }
             })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query source settings: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
+            .collect())
     }
 
     /// Set whether a source is enabled.
     pub fn set_source_enabled(&self, source: &str, enabled: bool) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO source_settings (source, enabled) VALUES (?1, ?2)
-             ON CONFLICT(source) DO UPDATE SET enabled = ?2",
-            params![source, enabled as i64],
-        )
-        .map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to set source enabled: {}", e))
-        })?;
-
-        Ok(())
+        let repo = SettingsRepository::new(self.conn.clone());
+        repo.set_source_enabled(source, enabled)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     pub fn focus_get_session(&self, id: &str) -> Result<Option<FocusSession>, PersistenceError> {

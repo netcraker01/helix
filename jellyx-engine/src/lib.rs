@@ -12,6 +12,7 @@ pub mod migration_lock;
 pub mod migrations;
 pub mod playlist_tracks;
 pub mod preferences;
+pub mod settings;
 pub mod sqlite;
 pub mod updater;
 pub mod user_playlists;
