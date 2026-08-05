@@ -12,7 +12,6 @@ use crate::app::{App, View};
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Layout: top tabs, middle content, bottom status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -63,29 +62,36 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_library(frame: &mut Frame, area: Rect, _app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Library")
-        .style(Style::default().fg(Color::White));
+fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Library ({}) — press r to refresh",
+        app.local_tracks.len()
+    ));
 
-    let content = vec![
-        Line::from(Span::styled(
-            "No tracks loaded yet.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from("Press Tab to switch views."),
-    ];
-
-    frame.render_widget(Paragraph::new(content).block(block), area);
+    if app.local_tracks.is_empty() {
+        let content = vec![
+            Line::from(Span::styled(
+                "No local tracks found.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Make sure Jellyx desktop has scanned your music folders."),
+            Line::from("Press 'r' to refresh, Tab to switch views."),
+        ];
+        frame.render_widget(Paragraph::new(content).block(block), area);
+    } else {
+        let items: Vec<ListItem> = app
+            .local_tracks
+            .iter()
+            .take(50)
+            .map(|t| ListItem::new(Line::from(t.as_str())))
+            .collect();
+        frame.render_widget(List::new(items).block(block), area);
+    }
 }
 
 fn draw_now_playing(frame: &mut Frame, area: Rect, _app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Now Playing")
-        .style(Style::default().fg(Color::White));
+    let block = Block::default().borders(Borders::ALL).title("Now Playing");
 
     let content = vec![
         Line::from(Span::styled(
@@ -93,20 +99,17 @@ fn draw_now_playing(frame: &mut Frame, area: Rect, _app: &App) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-        Line::from("Playback controls will appear here."),
+        Line::from("Playback integration coming soon."),
     ];
 
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
 fn draw_playlists(frame: &mut Frame, area: Rect, _app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Playlists")
-        .style(Style::default().fg(Color::White));
+    let block = Block::default().borders(Borders::ALL).title("Playlists");
 
     let content = vec![Line::from(Span::styled(
-        "No playlists found.",
+        "Playlist integration coming soon.",
         Style::default().fg(Color::DarkGray),
     ))];
 
@@ -116,8 +119,7 @@ fn draw_playlists(frame: &mut Frame, area: Rect, _app: &App) {
 fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Focus Session")
-        .style(Style::default().fg(Color::White));
+        .title("Focus Session");
 
     let content = vec![
         Line::from(Span::styled(
@@ -125,26 +127,60 @@ fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
-        Line::from("Press 's' to start a Pomodoro session (future)."),
+        Line::from("Focus session integration coming soon."),
     ];
 
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
-fn draw_settings(frame: &mut Frame, area: Rect, _app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Settings")
-        .style(Style::default().fg(Color::White));
+fn draw_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title("Settings");
 
-    let content = vec![
-        Line::from("Audio normalization: enabled (default)"),
-        Line::from("Telemetry: disabled (default)"),
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Audio Settings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "  Normalize audio: {}",
+            if app.normalize_audio { "ON" } else { "OFF" }
+        )),
         Line::from(""),
-        Line::from("Press Tab to switch views."),
+        Line::from(Span::styled(
+            "Sources",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
     ];
 
-    frame.render_widget(Paragraph::new(content).block(block), area);
+    for (source, enabled) in &app.source_settings {
+        lines.push(Line::from(format!(
+            "  {}: {}",
+            source,
+            if *enabled { "enabled" } else { "disabled" }
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Privacy",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(format!(
+        "  Telemetry: {}",
+        if app.telemetry_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {

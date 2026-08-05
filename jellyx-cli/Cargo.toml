@@ -14,5 +14,6 @@ jellyx-core = { path = "../jellyx-core" }
 jellyx-engine = { path = "../jellyx-engine" }
 ratatui = "0.30"
 crossterm = "0.29"
+dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

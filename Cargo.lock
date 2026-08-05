@@ -2434,6 +2434,7 @@ name = "jellyx-cli"
 version = "0.4.3"
 dependencies = [
  "crossterm",
+ "dirs 5.0.1",
  "jellyx-core",
  "jellyx-engine",
  "ratatui",
