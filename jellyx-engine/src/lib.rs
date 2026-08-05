@@ -11,6 +11,7 @@ pub mod audio_backend;
 pub mod dto;
 pub mod focus_session;
 pub mod history;
+pub mod http_stream;
 pub mod library_service;
 pub mod local_track;
 pub mod migration_lock;

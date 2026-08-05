@@ -6,6 +6,7 @@
 mod app;
 mod audio;
 mod event;
+mod sources;
 mod ui;
 
 use std::io;

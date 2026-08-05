@@ -64,8 +64,16 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
+    if app.searching {
+        draw_search(frame, area, app);
+    } else {
+        draw_track_list(frame, area, app);
+    }
+}
+
+fn draw_track_list(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "Library ({}) — Up/Down navigate, Enter play, r refresh",
+        "Library ({}) — Up/Down navigate, Enter play, / search, r refresh",
         app.tracks.len()
     ));
 
@@ -76,8 +84,8 @@ fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(""),
-            Line::from("Make sure Jellyx desktop has scanned your music folders."),
-            Line::from("Press 'r' to refresh."),
+            Line::from("Press '/' to search YouTube/SoundCloud."),
+            Line::from("Press 'r' to refresh local tracks."),
         ];
         frame.render_widget(Paragraph::new(content).block(block), area);
     } else {
@@ -106,6 +114,71 @@ fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
                     };
                 ListItem::new(Line::from(Span::styled(
                     format!("{} {} — {}", play_icon, t.artist, t.title),
+                    style,
+                )))
+            })
+            .collect();
+        frame.render_widget(List::new(items).block(block), area);
+    }
+}
+
+fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Search: \"{}\" — Esc cancel", app.search_query));
+
+    if app.search_results.is_empty() && !app.search_query.is_empty() {
+        let content = vec![
+            Line::from(Span::styled(
+                format!("Query: {}", app.search_query),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from("Press Enter to search YouTube + SoundCloud."),
+        ];
+        frame.render_widget(Paragraph::new(content).block(block), area);
+    } else if app.search_results.is_empty() {
+        let content = vec![
+            Line::from(Span::styled(
+                "Type to search — results from YouTube + SoundCloud",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Press '/' to start, type query, Enter to search."),
+            Line::from("Up/Down navigate, Enter to play, Esc to cancel."),
+        ];
+        frame.render_widget(Paragraph::new(content).block(block), area);
+    } else {
+        let items: Vec<ListItem> = app
+            .search_results
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let style = if i == app.search_cursor {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let source_tag = match t.source {
+                    jellyx_core::models::source::Source::YouTube => "[YT]",
+                    jellyx_core::models::source::Source::SoundCloud => "[SC]",
+                    _ => "[??]",
+                };
+                let dur = t
+                    .duration
+                    .map(|d| {
+                        format!(
+                            " ({:.0}:{:02})",
+                            (d / 60.0).floor(),
+                            (d % 60.0).round() as i64
+                        )
+                    })
+                    .unwrap_or_default();
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {} {} — {}{}", source_tag, t.artist, t.title, dur),
                     style,
                 )))
             })

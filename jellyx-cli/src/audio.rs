@@ -18,6 +18,7 @@ use symphonia_core::codecs::audio::AudioDecoder;
 use symphonia_core::formats::TrackType;
 
 use jellyx_engine::audio_backend::{AudioBackend, AudioError};
+use jellyx_engine::http_stream::HttpStreamReader;
 use jellyx_engine::playback_models::PlaybackState;
 
 fn codec_registry() -> &'static CodecRegistry {
@@ -62,8 +63,145 @@ impl Default for TuiAudioBackend {
 }
 
 impl AudioBackend for TuiAudioBackend {
-    fn play(&mut self, _url: &str) -> Result<(), AudioError> {
-        Err(AudioError::PlatformNotSupported)
+    fn play(&mut self, url: &str) -> Result<(), AudioError> {
+        self.stop()?;
+
+        // Download the remote stream into memory
+        let reader = HttpStreamReader::from_url(url)
+            .map_err(|e| AudioError::DecodeError(format!("stream download: {e}")))?;
+        let mss = MediaSourceStream::new(Box::new(reader), Default::default());
+
+        // Probe the format from the downloaded data
+        let format = symphonia::default::get_probe()
+            .probe(
+                &Hint::new(),
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| AudioError::DecodeError(format!("probe: {e}")))?;
+
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or_else(|| AudioError::UnsupportedFormat)?;
+
+        let track_id = track.id;
+        let codec_params = track
+            .codec_params
+            .as_ref()
+            .ok_or_else(|| AudioError::DecodeError("no codec params".into()))?;
+        let audio_params = codec_params
+            .audio()
+            .ok_or_else(|| AudioError::DecodeError("not audio".into()))?;
+
+        let channels = audio_params
+            .channels
+            .clone()
+            .map(|c| c.count())
+            .unwrap_or(2)
+            .max(1) as u16;
+        let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+
+        let decoder = codec_registry()
+            .make_audio_decoder(audio_params, &AudioDecoderOptions::default())
+            .map_err(|e| AudioError::DecodeError(format!("codec: {e}")))?;
+
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| AudioError::NoAudioDevice("no output".into()))?;
+
+        let config = StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let (tx, rx): (Sender<f32>, Receiver<f32>) = unbounded();
+
+        let state = self.state.clone();
+        let decoder_stop = self.stop_flag.clone();
+        let format_reader: Arc<Mutex<Box<dyn FormatReader>>> = Arc::new(Mutex::new(format));
+
+        std::thread::spawn(move || {
+            let mut decoder = decoder;
+            let mut buffer = vec![0.0f32; 4096];
+
+            loop {
+                if decoder_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let packet = {
+                    let mut reader = format_reader.lock().unwrap();
+                    match reader.next_packet() {
+                        Ok(Some(pkt)) => pkt,
+                        Ok(None) => break,
+                        Err(SymphoniaError::IoError(ref e))
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                        {
+                            *state.lock().unwrap() = PlaybackState::Stopped;
+                            break;
+                        }
+                        Err(SymphoniaError::ResetRequired) => continue,
+                        Err(e) => {
+                            eprintln!("[tui-stream] packet: {e}");
+                            break;
+                        }
+                    }
+                };
+
+                if packet.track_id != track_id {
+                    continue;
+                }
+
+                match decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let n = decoded.samples_interleaved();
+                        if n == 0 {
+                            continue;
+                        }
+                        if n > buffer.len() {
+                            buffer.resize(n, 0.0);
+                        }
+                        buffer[..n].fill(0.0);
+                        decoded.copy_to_slice_interleaved(&mut buffer[..n]);
+                        for &s in &buffer[..n] {
+                            let _ = tx.try_send(s);
+                        }
+                    }
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(SymphoniaError::IoError(_)) => continue,
+                    Err(e) => {
+                        eprintln!("[tui-stream] decode: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let volume = self.volume.clone();
+        let stream = device
+            .build_output_stream(
+                &config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let vol = *volume.lock().unwrap();
+                    for sample in data.iter_mut() {
+                        *sample = rx.try_recv().unwrap_or(0.0) * vol;
+                    }
+                },
+                |e| eprintln!("[tui-stream] stream: {e}"),
+                None,
+            )
+            .map_err(|e| AudioError::DeviceError(format!("stream: {e}")))?;
+
+        stream
+            .play()
+            .map_err(|e| AudioError::DeviceError(format!("play: {e}")))?;
+
+        self.stream = Some(stream);
+        self.set_state(PlaybackState::Playing);
+        Ok(())
     }
 
     fn play_local(&mut self, path: &Path) -> Result<(), AudioError> {

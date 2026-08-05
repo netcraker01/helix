@@ -21,3 +21,5 @@ cpal = "0.15"
 symphonia = { version = "0.6", features = ["mp3", "isomp4", "aac", "ogg", "vorbis", "flac", "wav", "pcm"] }
 symphonia-core = "0.6"
 crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "default-tls", "charset"] }
+which = "7"

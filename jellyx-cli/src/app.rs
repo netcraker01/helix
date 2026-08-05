@@ -12,6 +12,7 @@ use jellyx_engine::playback_models::PlaybackState;
 use jellyx_engine::playlist_service::PlaylistService;
 use jellyx_engine::preferences::PreferencesRepository;
 use jellyx_engine::settings_service::SettingsService;
+use jellyx_engine::source_resolver::{SourceRegistry, SourceResolver};
 use jellyx_engine::sqlite::SqliteHandle;
 use jellyx_engine::user_playlists::UserPlaylist;
 use std::path::PathBuf;
@@ -89,6 +90,15 @@ pub struct PlaylistTrackEntry {
     pub local_path: Option<String>,
 }
 
+/// A remote track from YouTube/SoundCloud search.
+pub struct RemoteTrackEntry {
+    pub id: String,
+    pub source: jellyx_core::models::source::Source,
+    pub title: String,
+    pub artist: String,
+    pub duration: Option<f64>,
+}
+
 /// Top-level application state.
 pub struct App {
     pub view: View,
@@ -118,7 +128,13 @@ pub struct App {
     pub now_playing: Option<String>,
     // Focus
     pub focus_prefs: Option<FocusPreferencesRow>,
-    pub focus_active: Option<String>, // session intention if active
+    pub focus_active: Option<String>,
+    // Remote sources
+    pub sources: SourceRegistry,
+    pub search_query: String,
+    pub search_results: Vec<RemoteTrackEntry>,
+    pub search_cursor: usize,
+    pub searching: bool,
 }
 
 impl App {
@@ -147,6 +163,16 @@ impl App {
             now_playing: None,
             focus_prefs: None,
             focus_active: None,
+            sources: {
+                let mut reg = SourceRegistry::new();
+                reg.register(Box::new(crate::sources::YouTubeResolver));
+                reg.register(Box::new(crate::sources::SoundCloudResolver));
+                reg
+            },
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_cursor: 0,
+            searching: false,
         };
         app.try_init_engine();
         app
@@ -341,7 +367,112 @@ impl App {
                 self.play_playlist_track();
                 false
             }
+            // Search mode in Library
+            KeyCode::Char('/') if self.view == View::Library => {
+                self.search_query.clear();
+                self.search_results.clear();
+                self.searching = true;
+                self.message = "Search (YouTube/SoundCloud): type query, Enter to search".into();
+                false
+            }
+            KeyCode::Char(c) if self.view == View::Library && self.searching => {
+                if c == '\n' || c == '\r' {
+                    self.do_remote_search();
+                } else if (c as u8) == 127 || c == '\u{8}' {
+                    self.search_query.pop();
+                } else {
+                    self.search_query.push(c);
+                }
+                false
+            }
+            KeyCode::Enter
+                if self.view == View::Library
+                    && self.searching
+                    && !self.search_results.is_empty() =>
+            {
+                self.play_remote_track();
+                false
+            }
+            KeyCode::Up
+                if self.view == View::Library
+                    && self.searching
+                    && !self.search_results.is_empty() =>
+            {
+                if self.search_cursor > 0 {
+                    self.search_cursor -= 1;
+                }
+                false
+            }
+            KeyCode::Down
+                if self.view == View::Library
+                    && self.searching
+                    && !self.search_results.is_empty() =>
+            {
+                if self.search_cursor + 1 < self.search_results.len() {
+                    self.search_cursor += 1;
+                }
+                false
+            }
+            KeyCode::Esc if self.searching => {
+                self.searching = false;
+                self.search_results.clear();
+                self.message = "Search cancelled".into();
+                false
+            }
             _ => false,
+        }
+    }
+
+    fn do_remote_search(&mut self) {
+        if self.search_query.is_empty() {
+            self.message = "Empty query".into();
+            return;
+        }
+        self.message = format!("Searching: {}...", self.search_query);
+        let results = self.sources.search_all(&self.search_query);
+        self.search_results = results
+            .into_iter()
+            .map(|t| RemoteTrackEntry {
+                id: t.id.clone(),
+                source: t.source.clone(),
+                title: t.title,
+                artist: t.artist,
+                duration: t.duration,
+            })
+            .take(50)
+            .collect();
+        self.search_cursor = 0;
+        self.message = format!(
+            "Found {} results — Enter to play, Up/Down to navigate",
+            self.search_results.len()
+        );
+    }
+
+    fn play_remote_track(&mut self) {
+        let entry = match self.search_results.get(self.search_cursor) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        self.message = format!("Resolving stream: {} — {}...", entry.artist, entry.title);
+        match self.sources.resolve_stream_url(&entry.source, &entry.id) {
+            Ok(url) => {
+                self.message = format!("Stream resolved, downloading...");
+                match self.audio.play(&url) {
+                    Ok(()) => {
+                        self.playback_state = PlaybackState::Playing;
+                        self.now_playing = Some(format!("{} — {}", entry.artist, entry.title));
+                        self.message = format!("Playing: {}", self.now_playing.as_ref().unwrap());
+                        self.searching = false;
+                    }
+                    Err(e) => {
+                        self.message = format!("Playback error: {e:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                self.message = format!("Resolve error: {e}");
+            }
         }
     }
 
