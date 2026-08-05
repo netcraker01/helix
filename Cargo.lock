@@ -2435,7 +2435,10 @@ version = "0.4.3"
 dependencies = [
  "crossterm",
  "jellyx-core",
+ "jellyx-engine",
  "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
