@@ -15,6 +15,7 @@ pub mod library_service;
 pub mod local_track;
 pub mod migration_lock;
 pub mod migrations;
+pub mod playback_events;
 pub mod playback_models;
 pub mod playlist_service;
 pub mod playlist_tracks;

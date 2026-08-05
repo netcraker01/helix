@@ -31,6 +31,7 @@ use crate::sources::local::LocalResolver;
 use crate::sources::soundcloud::SoundCloudResolver;
 use crate::sources::youtube::YouTubeResolver;
 use crate::sources::SourceRegistry;
+use jellyx_engine::playback_events::PlaybackEventEmitter as _PlaybackEventEmitterTrait;
 
 use crate::visualizer::fft_bridge::emit_fft_frame;
 use jellyx_core::models::source::Source;
