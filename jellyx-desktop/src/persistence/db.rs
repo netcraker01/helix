@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use jellyx_engine::artist_favorites::ArtistFavoritesRepository;
 use jellyx_engine::focus_session::FocusSessionRepository;
+use jellyx_engine::history::HistoryRepository;
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::migrations as engine_migrations;
 use jellyx_engine::playlist_tracks::PlaylistTracksRepository;
@@ -64,9 +65,6 @@ const SCHEMA_VERSION_V8: u32 = 8;
 const SCHEMA_VERSION_V10: u32 = 10;
 /// Singleton row key for settings tables that intentionally contain one row.
 const SETTINGS_SINGLETON_ID: i64 = 1;
-
-/// Default history query limit.
-const HISTORY_LIMIT: u32 = 100;
 
 /// SQLite-backed database for Jellyx library data.
 ///
@@ -304,150 +302,76 @@ impl Database {
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
-    /// Record a play event in history.
-    ///
-    /// Evicts the oldest entry when history exceeds `HISTORY_LIMIT` entries
-    /// so the table stays bounded to the 100 most recent plays.
     pub fn insert_history(&self, track: &Track) -> Result<(), PersistenceError> {
         let track_json = serde_json::to_string(track).map_err(|e| {
             PersistenceError::WriteError(format!("failed to serialize track: {}", e))
         })?;
-
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute(
-            "INSERT INTO history (track_id, track_json) VALUES (?1, ?2)",
-            params![track.id, track_json],
-        )
-        .map_err(|e| PersistenceError::DatabaseError(format!("failed to insert history: {}", e)))?;
-
-        // Evict oldest entries if we've exceeded the limit.
-        conn.execute(
-            "DELETE FROM history WHERE id IN (
-                    SELECT id FROM history ORDER BY played_at ASC LIMIT (
-                        SELECT MAX(0, COUNT(*) - ?1) FROM history
-                    )
-                )",
-            params![HISTORY_LIMIT],
-        )
-        .map_err(|e| PersistenceError::DatabaseError(format!("failed to evict history: {}", e)))?;
-
-        Ok(())
+        let repo = HistoryRepository::new(self.conn.clone());
+        repo.insert(&track.id, &track_json)
+            .map_err(PersistenceError::DatabaseError)
     }
 
-    /// Get play history, ordered by most recent first (default limit 50).
     pub fn get_history(&self) -> Result<Vec<HistoryEntry>, PersistenceError> {
-        self.get_history_with_limit(HISTORY_LIMIT)
+        let repo = HistoryRepository::new(self.conn.clone());
+        let rows = repo.get().map_err(PersistenceError::DatabaseError)?;
+        rows.into_iter()
+            .map(|row| {
+                let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
+                    PersistenceError::DatabaseError(format!("failed to deserialize track: {}", e))
+                })?;
+                Ok(HistoryEntry {
+                    id: row.id,
+                    track,
+                    played_at: row.played_at,
+                })
+            })
+            .collect()
     }
 
-    /// Get play history with a custom limit, ordered by most recent first.
     pub fn get_history_with_limit(
         &self,
         limit: u32,
     ) -> Result<Vec<HistoryEntry>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, track_id, track_json, played_at FROM history ORDER BY played_at DESC, id DESC LIMIT ?1",
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to prepare history query: {}", e))
-            })?;
-
-        let entries = stmt
-            .query_map(params![limit], |row| {
-                let track_json: String = row.get(2)?;
-                let track: Track = serde_json::from_str(&track_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        track_json.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+        let repo = HistoryRepository::new(self.conn.clone());
+        let rows = repo
+            .get_with_limit(limit)
+            .map_err(PersistenceError::DatabaseError)?;
+        rows.into_iter()
+            .map(|row| {
+                let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
+                    PersistenceError::DatabaseError(format!("failed to deserialize track: {}", e))
                 })?;
                 Ok(HistoryEntry {
-                    id: row.get(0)?,
+                    id: row.id,
                     track,
-                    played_at: row.get(3)?,
+                    played_at: row.played_at,
                 })
             })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query history: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
+            .collect()
     }
 
-    /// Get recently played tracks deduplicated by track_id.
-    ///
-    /// Returns only the most recent entry per track_id, ordered by most recent
-    /// first. Used by the Home page "recently played" list so the same track
-    /// doesn't appear multiple times. The full event log (with duplicates) is
-    /// still available via `get_history` for play counts and recommendations.
     pub fn get_recent_unique(&self, limit: u32) -> Result<Vec<HistoryEntry>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT h.id, h.track_id, h.track_json, h.played_at
-                 FROM history h
-                 WHERE h.id = (
-                     SELECT MAX(h2.id) FROM history h2 WHERE h2.track_id = h.track_id
-                 )
-                 ORDER BY h.played_at DESC, h.id DESC
-                 LIMIT ?1",
-            )
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare recent-unique query: {}",
-                    e
-                ))
-            })?;
-
-        let entries = stmt
-            .query_map(params![limit], |row| {
-                let track_json: String = row.get(2)?;
-                let track: Track = serde_json::from_str(&track_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        track_json.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+        let repo = HistoryRepository::new(self.conn.clone());
+        let rows = repo
+            .get_recent_unique(limit)
+            .map_err(PersistenceError::DatabaseError)?;
+        rows.into_iter()
+            .map(|row| {
+                let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
+                    PersistenceError::DatabaseError(format!("failed to deserialize track: {}", e))
                 })?;
                 Ok(HistoryEntry {
-                    id: row.get(0)?,
+                    id: row.id,
                     track,
-                    played_at: row.get(3)?,
+                    played_at: row.played_at,
                 })
             })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query recent-unique: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(entries)
+            .collect()
     }
 
-    /// Clear all history entries.
     pub fn clear_history(&self) -> Result<(), PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        conn.execute("DELETE FROM history", []).map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to clear history: {}", e))
-        })?;
-
-        Ok(())
+        let repo = HistoryRepository::new(self.conn.clone());
+        repo.clear().map_err(PersistenceError::DatabaseError)
     }
 
     /// Get the current schema version.
