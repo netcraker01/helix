@@ -8,9 +8,11 @@ use jellyx_engine::audio_backend::AudioBackend;
 use jellyx_engine::library_service::LibraryService;
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::playback_models::PlaybackState;
+use jellyx_engine::playlist_service::PlaylistService;
 use jellyx_engine::preferences::PreferencesRepository;
 use jellyx_engine::settings_service::SettingsService;
 use jellyx_engine::sqlite::SqliteHandle;
+use jellyx_engine::user_playlists::UserPlaylist;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +74,20 @@ pub struct TrackEntry {
     pub local_path: Option<String>,
 }
 
+/// A playlist entry for the playlists view.
+pub struct PlaylistEntry {
+    pub id: String,
+    pub title: String,
+    pub track_count: u32,
+}
+
+/// A track inside a playlist.
+pub struct PlaylistTrackEntry {
+    pub title: String,
+    pub artist: String,
+    pub local_path: Option<String>,
+}
+
 /// Top-level application state.
 pub struct App {
     pub view: View,
@@ -80,14 +96,25 @@ pub struct App {
     pub db: Option<SqliteHandle>,
     pub library: Option<LibraryService>,
     pub settings: Option<SettingsService>,
+    pub playlists: Option<PlaylistService>,
+    // Library view
     pub tracks: Vec<TrackEntry>,
     pub selected_track: usize,
+    // Playlist view
+    pub playlist_list: Vec<PlaylistEntry>,
+    pub selected_playlist: usize,
+    pub playlist_tracks: Vec<PlaylistTrackEntry>,
+    pub selected_playlist_track: usize,
+    pub viewing_playlist_tracks: bool,
+    // Settings
     pub source_settings: Vec<(String, bool)>,
     pub normalize_audio: bool,
     pub telemetry_enabled: bool,
+    // Playback
     pub audio: TuiAudioBackend,
     pub playback_state: PlaybackState,
     pub volume: f32,
+    pub now_playing: Option<String>,
 }
 
 impl App {
@@ -99,14 +126,21 @@ impl App {
             db: None,
             library: None,
             settings: None,
+            playlists: None,
             tracks: Vec::new(),
             selected_track: 0,
+            playlist_list: Vec::new(),
+            selected_playlist: 0,
+            playlist_tracks: Vec::new(),
+            selected_playlist_track: 0,
+            viewing_playlist_tracks: false,
             source_settings: Vec::new(),
             normalize_audio: true,
             telemetry_enabled: false,
             audio: TuiAudioBackend::new(),
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
+            now_playing: None,
         };
         app.try_init_engine();
         app
@@ -141,6 +175,7 @@ impl App {
             Ok(handle) => {
                 self.library = Some(LibraryService::new(handle.clone()));
                 self.settings = Some(SettingsService::new(Arc::new(handle.clone())));
+                self.playlists = Some(PlaylistService::new(handle.clone()));
                 self.db = Some(handle);
                 self.refresh_data();
                 self.message = "Engine initialized — data loaded".into();
@@ -171,6 +206,19 @@ impl App {
             }
         }
 
+        if let Some(playlists) = &self.playlists {
+            if let Ok(list) = playlists.get_all_playlists() {
+                self.playlist_list = list
+                    .into_iter()
+                    .map(|p| PlaylistEntry {
+                        track_count: playlists.count_playlist_tracks(&p.id).unwrap_or(0),
+                        id: p.id,
+                        title: p.title,
+                    })
+                    .collect();
+            }
+        }
+
         if let Some(settings) = &self.settings {
             if let Ok(sources) = settings.get_source_settings() {
                 self.source_settings = sources.into_iter().map(|s| (s.source, s.enabled)).collect();
@@ -186,7 +234,17 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Char('q') => true,
+            KeyCode::Esc => {
+                if self.viewing_playlist_tracks {
+                    self.viewing_playlist_tracks = false;
+                    self.playlist_tracks.clear();
+                    self.message = "Back to playlists".into();
+                    false
+                } else {
+                    true
+                }
+            }
             KeyCode::Tab => {
                 self.view = self.view.next();
                 self.message = format!("View: {}", self.view.label());
@@ -202,29 +260,15 @@ impl App {
                 self.message = "Data refreshed".into();
                 false
             }
-            // Playback controls
-            KeyCode::Char(' ') => {
-                match self.playback_state {
-                    PlaybackState::Playing => {
-                        let _ = self.audio.pause();
-                        self.playback_state = PlaybackState::Paused;
-                        self.message = "Paused".into();
-                    }
-                    PlaybackState::Paused => {
-                        let _ = self.audio.resume();
-                        self.playback_state = PlaybackState::Playing;
-                        self.message = "Resumed".into();
-                    }
-                    _ => {}
-                }
-                false
-            }
+            KeyCode::Char(' ') => self.handle_space(),
             KeyCode::Char('s') => {
                 let _ = self.audio.stop();
                 self.playback_state = PlaybackState::Stopped;
+                self.now_playing = None;
                 self.message = "Stopped".into();
                 false
             }
+            // Library
             KeyCode::Up if self.view == View::Library => {
                 if self.selected_track > 0 {
                     self.selected_track -= 1;
@@ -238,25 +282,123 @@ impl App {
                 false
             }
             KeyCode::Enter if self.view == View::Library => {
-                if let Some(track) = self.tracks.get(self.selected_track) {
-                    if let Some(ref path) = track.local_path {
-                        match self.audio.play_local(std::path::Path::new(path)) {
-                            Ok(()) => {
-                                self.playback_state = PlaybackState::Playing;
-                                self.message =
-                                    format!("Playing: {} — {}", track.artist, track.title);
-                            }
-                            Err(e) => {
-                                self.message = format!("Playback error: {e:?}");
-                            }
-                        }
-                    } else {
-                        self.message = "No local path for this track".into();
-                    }
+                self.play_selected_track();
+                false
+            }
+            // Playlists list
+            KeyCode::Up if self.view == View::Playlists && !self.viewing_playlist_tracks => {
+                if self.selected_playlist > 0 {
+                    self.selected_playlist -= 1;
                 }
                 false
             }
+            KeyCode::Down if self.view == View::Playlists && !self.viewing_playlist_tracks => {
+                if self.selected_playlist + 1 < self.playlist_list.len() {
+                    self.selected_playlist += 1;
+                }
+                false
+            }
+            KeyCode::Enter if self.view == View::Playlists && !self.viewing_playlist_tracks => {
+                self.load_playlist_tracks();
+                false
+            }
+            // Playlist tracks
+            KeyCode::Up if self.view == View::Playlists && self.viewing_playlist_tracks => {
+                if self.selected_playlist_track > 0 {
+                    self.selected_playlist_track -= 1;
+                }
+                false
+            }
+            KeyCode::Down if self.view == View::Playlists && self.viewing_playlist_tracks => {
+                if self.selected_playlist_track + 1 < self.playlist_tracks.len() {
+                    self.selected_playlist_track += 1;
+                }
+                false
+            }
+            KeyCode::Enter if self.view == View::Playlists && self.viewing_playlist_tracks => {
+                self.play_playlist_track();
+                false
+            }
             _ => false,
+        }
+    }
+
+    fn handle_space(&mut self) -> bool {
+        match self.playback_state {
+            PlaybackState::Playing => {
+                let _ = self.audio.pause();
+                self.playback_state = PlaybackState::Paused;
+                self.message = "Paused".into();
+            }
+            PlaybackState::Paused => {
+                let _ = self.audio.resume();
+                self.playback_state = PlaybackState::Playing;
+                self.message = "Resumed".into();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn play_selected_track(&mut self) {
+        if let Some(track) = self.tracks.get(self.selected_track) {
+            let title = track.title.clone();
+            let artist = track.artist.clone();
+            let path = track.local_path.clone();
+            self.play_track(&title, &artist, path.as_deref());
+        }
+    }
+
+    fn play_playlist_track(&mut self) {
+        if let Some(track) = self.playlist_tracks.get(self.selected_playlist_track) {
+            let title = track.title.clone();
+            let artist = track.artist.clone();
+            let path = track.local_path.clone();
+            self.play_track(&title, &artist, path.as_deref());
+        }
+    }
+
+    fn play_track(&mut self, title: &str, artist: &str, local_path: Option<&str>) {
+        if let Some(path) = local_path {
+            match self.audio.play_local(std::path::Path::new(path)) {
+                Ok(()) => {
+                    self.playback_state = PlaybackState::Playing;
+                    self.now_playing = Some(format!("{artist} — {title}"));
+                    self.message = format!("Playing: {}", self.now_playing.as_ref().unwrap());
+                }
+                Err(e) => {
+                    self.message = format!("Playback error: {e:?}");
+                }
+            }
+        } else {
+            self.message = "No local path for this track".into();
+        }
+    }
+
+    fn load_playlist_tracks(&mut self) {
+        let playlist_id = match self.playlist_list.get(self.selected_playlist) {
+            Some(p) => p.id.clone(),
+            None => return,
+        };
+
+        if let Some(playlists) = &self.playlists {
+            if let Ok(tracks) = playlists.get_playlist_tracks(&playlist_id) {
+                self.playlist_tracks = tracks
+                    .into_iter()
+                    .map(|t| PlaylistTrackEntry {
+                        title: t.track.title.clone(),
+                        artist: t.track.artist.clone(),
+                        local_path: t.track.local_path.clone(),
+                    })
+                    .collect();
+                self.selected_playlist_track = 0;
+                self.viewing_playlist_tracks = true;
+                self.message = format!(
+                    "{} ({} tracks) — Esc to go back",
+                    self.playlist_list[self.selected_playlist].title,
+                    self.playlist_tracks.len()
+                );
+            }
         }
     }
 }

@@ -125,41 +125,122 @@ fn draw_now_playing(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let pos = app.audio.position();
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("State: {}", state_str),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(format!("Position: {:.1}s", pos)),
-        Line::from(""),
-        Line::from(Span::styled("Controls", Style::default().fg(Color::Yellow))),
-        Line::from("  Space — Play/Pause"),
-        Line::from("  s — Stop"),
-        Line::from("  Up/Down — Navigate library"),
-        Line::from("  Enter — Play selected track"),
-    ];
 
-    if let Some(track) = app.tracks.get(app.selected_track) {
-        if app.playback_state != PlaybackState::Stopped {
-            lines.insert(
-                1,
-                Line::from(format!("Track: {} — {}", track.artist, track.title)),
-            );
-        }
+    let mut lines = vec![Line::from(Span::styled(
+        format!("State: {}", state_str),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    if let Some(ref np) = app.now_playing {
+        lines.push(Line::from(format!("Track: {}", np)));
+        lines.push(Line::from(format!("Position: {:.1}s", pos)));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No track playing.",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Controls",
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from("  Space — Play/Pause"));
+    lines.push(Line::from("  s — Stop"));
+    lines.push(Line::from("  Up/Down — Navigate"));
+    lines.push(Line::from("  Enter — Play selected track"));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_playlists(frame: &mut Frame, area: Rect, _app: &App) {
-    let block = Block::default().borders(Borders::ALL).title("Playlists");
-    let content = vec![Line::from(Span::styled(
-        "Playlist integration coming soon.",
-        Style::default().fg(Color::DarkGray),
-    ))];
-    frame.render_widget(Paragraph::new(content).block(block), area);
+fn draw_playlists(frame: &mut Frame, area: Rect, app: &App) {
+    if app.viewing_playlist_tracks {
+        draw_playlist_tracks(frame, area, app);
+    } else {
+        draw_playlist_list(frame, area, app);
+    }
+}
+
+fn draw_playlist_list(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Playlists ({}) — Enter to open",
+        app.playlist_list.len()
+    ));
+
+    if app.playlist_list.is_empty() {
+        let content = vec![
+            Line::from(Span::styled(
+                "No playlists found.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Press 'r' to refresh."),
+        ];
+        frame.render_widget(Paragraph::new(content).block(block), area);
+    } else {
+        let items: Vec<ListItem> = app
+            .playlist_list
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let style = if i == app.selected_playlist {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {} ({} tracks)", p.title, p.track_count),
+                    style,
+                )))
+            })
+            .collect();
+        frame.render_widget(List::new(items).block(block), area);
+    }
+}
+
+fn draw_playlist_tracks(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Tracks ({}) — Esc to go back, Enter to play",
+        app.playlist_tracks.len()
+    ));
+
+    if app.playlist_tracks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                "This playlist is empty.",
+                Style::default().fg(Color::DarkGray),
+            ))])
+            .block(block),
+            area,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .playlist_tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let style = if i == app.selected_playlist_track {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("  {} — {}", t.artist, t.title),
+                    style,
+                )))
+            })
+            .collect();
+        frame.render_widget(List::new(items).block(block), area);
+    }
 }
 
 fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
