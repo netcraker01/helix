@@ -243,19 +243,58 @@ fn draw_playlist_tracks(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
+fn draw_focus(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Focus Session");
-    let content = vec![
-        Line::from(Span::styled(
+
+    let mut lines = Vec::new();
+
+    if let Some(ref active) = app.focus_active {
+        lines.push(Line::from(Span::styled(
+            format!("Active: {}", active),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
             "No active focus session.",
             Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from("Focus session integration coming soon."),
-    ];
-    frame.render_widget(Paragraph::new(content).block(block), area);
+        )));
+    }
+
+    lines.push(Line::from(""));
+
+    if let Some(ref prefs) = app.focus_prefs {
+        lines.push(Line::from(Span::styled(
+            "Preferences",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            "  Workflow: {}",
+            prefs.default_workflow
+        )));
+        lines.push(Line::from(format!(
+            "  Work: {}ms, Break: {}ms, Rounds: {}",
+            prefs.work_duration_ms, prefs.break_duration_ms, prefs.rounds
+        )));
+        lines.push(Line::from(format!(
+            "  Music: {} {}",
+            prefs.music_strategy,
+            prefs.music_value.as_deref().unwrap_or("")
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press 'r' to refresh focus data.",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_settings(frame: &mut Frame, area: Rect, app: &App) {

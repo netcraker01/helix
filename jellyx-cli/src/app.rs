@@ -5,6 +5,7 @@
 
 use crossterm::event::KeyCode;
 use jellyx_engine::audio_backend::AudioBackend;
+use jellyx_engine::focus_session::{FocusPreferencesRow, FocusSessionRepository};
 use jellyx_engine::library_service::LibraryService;
 use jellyx_engine::local_track::LocalTrackRepository;
 use jellyx_engine::playback_models::PlaybackState;
@@ -115,6 +116,9 @@ pub struct App {
     pub playback_state: PlaybackState,
     pub volume: f32,
     pub now_playing: Option<String>,
+    // Focus
+    pub focus_prefs: Option<FocusPreferencesRow>,
+    pub focus_active: Option<String>, // session intention if active
 }
 
 impl App {
@@ -141,6 +145,8 @@ impl App {
             playback_state: PlaybackState::Stopped,
             volume: 1.0,
             now_playing: None,
+            focus_prefs: None,
+            focus_active: None,
         };
         app.try_init_engine();
         app
@@ -228,6 +234,22 @@ impl App {
             }
             if let Ok(telemetry) = settings.get_telemetry_settings() {
                 self.telemetry_enabled = telemetry.enabled;
+            }
+        }
+
+        // Focus data
+        if let Some(handle) = &self.db {
+            let repo = FocusSessionRepository::new(handle.clone());
+            if let Ok(prefs) = repo.get_preferences() {
+                self.focus_prefs = Some(prefs);
+            }
+            if let Ok(Some(session)) = repo.get_nonterminal_session() {
+                self.focus_active = Some(format!(
+                    "{} (round {}, phase: {})",
+                    session.intention, session.round, session.phase
+                ));
+            } else {
+                self.focus_active = None;
             }
         }
     }
