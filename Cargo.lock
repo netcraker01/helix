@@ -2495,6 +2495,7 @@ dependencies = [
  "fs4",
  "jellyx-core",
  "percent-encoding",
+ "rand 0.8.6",
  "rusqlite",
  "rustix",
  "serde",

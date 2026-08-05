@@ -10,6 +10,7 @@ pub mod artist_favorites;
 pub mod dto;
 pub mod focus_session;
 pub mod history;
+pub mod library_service;
 pub mod local_track;
 pub mod migration_lock;
 pub mod migrations;

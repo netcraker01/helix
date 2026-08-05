@@ -199,7 +199,7 @@ impl LocalTrackRepository {
                 Some("sqlite connection lock poisoned".to_string()),
             )
         })?;
-        let pattern = format!("%\"artist\":\"{}%\"", artist.to_lowercase());
+        let pattern = format!("%\"artist\":\"{}\"%", artist.to_lowercase());
         let mut stmt = conn.prepare(
             "SELECT file_path, track_json, folder_path, file_modified_at, subfolder_path FROM local_tracks WHERE lower(track_json) LIKE ?1 ORDER BY file_path",
         )?;
@@ -227,7 +227,7 @@ impl LocalTrackRepository {
                 Some("sqlite connection lock poisoned".to_string()),
             )
         })?;
-        let pattern = format!("%\"album\":\"{}%\"", album.to_lowercase());
+        let pattern = format!("%\"album\":\"{}\"%", album.to_lowercase());
         let mut stmt = conn.prepare(
             "SELECT file_path, track_json, folder_path, file_modified_at, subfolder_path FROM local_tracks WHERE lower(track_json) LIKE ?1 ORDER BY file_path",
         )?;

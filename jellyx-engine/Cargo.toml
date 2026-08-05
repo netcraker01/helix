@@ -13,6 +13,7 @@ path = "src/lib.rs"
 fs4 = "1.1"
 jellyx-core = { path = "../jellyx-core" }
 percent-encoding = "2"
+rand = "0.8"
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
