@@ -17,6 +17,7 @@ pub mod migrations;
 pub mod playlist_tracks;
 pub mod preferences;
 pub mod settings;
+pub mod settings_service;
 pub mod sqlite;
 pub mod suggestions;
 pub mod updater;
