@@ -4,6 +4,7 @@
 //! settings, focus). This crate only handles terminal I/O and rendering.
 
 mod app;
+mod audio;
 mod event;
 mod ui;
 

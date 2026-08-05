@@ -7,8 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
 use crate::app::{App, View};
+use jellyx_engine::audio_backend::AudioBackend;
+use jellyx_engine::playback_models::PlaybackState;
 
-/// Main draw function called every frame.
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
@@ -64,11 +65,11 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "Library ({}) — press r to refresh",
-        app.local_tracks.len()
+        "Library ({}) — Up/Down navigate, Enter play, r refresh",
+        app.tracks.len()
     ));
 
-    if app.local_tracks.is_empty() {
+    if app.tracks.is_empty() {
         let content = vec![
             Line::from(Span::styled(
                 "No local tracks found.",
@@ -76,43 +77,88 @@ fn draw_library(frame: &mut Frame, area: Rect, app: &App) {
             )),
             Line::from(""),
             Line::from("Make sure Jellyx desktop has scanned your music folders."),
-            Line::from("Press 'r' to refresh, Tab to switch views."),
+            Line::from("Press 'r' to refresh."),
         ];
         frame.render_widget(Paragraph::new(content).block(block), area);
     } else {
         let items: Vec<ListItem> = app
-            .local_tracks
+            .tracks
             .iter()
-            .take(50)
-            .map(|t| ListItem::new(Line::from(t.as_str())))
+            .enumerate()
+            .map(|(i, t)| {
+                let style = if i == app.selected_track {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let play_icon =
+                    if i == app.selected_track && app.playback_state != PlaybackState::Stopped {
+                        if app.playback_state == PlaybackState::Playing {
+                            "▶"
+                        } else {
+                            "⏸"
+                        }
+                    } else {
+                        " "
+                    };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{} {} — {}", play_icon, t.artist, t.title),
+                    style,
+                )))
+            })
             .collect();
         frame.render_widget(List::new(items).block(block), area);
     }
 }
 
-fn draw_now_playing(frame: &mut Frame, area: Rect, _app: &App) {
+fn draw_now_playing(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title("Now Playing");
 
-    let content = vec![
+    let state_str = match app.playback_state {
+        PlaybackState::Stopped => "Stopped",
+        PlaybackState::Playing => "Playing",
+        PlaybackState::Paused => "Paused",
+        PlaybackState::Buffering(_) => "Buffering",
+    };
+
+    let pos = app.audio.position();
+    let mut lines = vec![
         Line::from(Span::styled(
-            "No track playing.",
-            Style::default().fg(Color::DarkGray),
+            format!("State: {}", state_str),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
+        Line::from(format!("Position: {:.1}s", pos)),
         Line::from(""),
-        Line::from("Playback integration coming soon."),
+        Line::from(Span::styled("Controls", Style::default().fg(Color::Yellow))),
+        Line::from("  Space — Play/Pause"),
+        Line::from("  s — Stop"),
+        Line::from("  Up/Down — Navigate library"),
+        Line::from("  Enter — Play selected track"),
     ];
 
-    frame.render_widget(Paragraph::new(content).block(block), area);
+    if let Some(track) = app.tracks.get(app.selected_track) {
+        if app.playback_state != PlaybackState::Stopped {
+            lines.insert(
+                1,
+                Line::from(format!("Track: {} — {}", track.artist, track.title)),
+            );
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_playlists(frame: &mut Frame, area: Rect, _app: &App) {
     let block = Block::default().borders(Borders::ALL).title("Playlists");
-
     let content = vec![Line::from(Span::styled(
         "Playlist integration coming soon.",
         Style::default().fg(Color::DarkGray),
     ))];
-
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
@@ -120,7 +166,6 @@ fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Focus Session");
-
     let content = vec![
         Line::from(Span::styled(
             "No active focus session.",
@@ -129,7 +174,6 @@ fn draw_focus(frame: &mut Frame, area: Rect, _app: &App) {
         Line::from(""),
         Line::from("Focus session integration coming soon."),
     ];
-
     frame.render_widget(Paragraph::new(content).block(block), area);
 }
 
@@ -138,13 +182,13 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "Audio Settings",
+            "Audio",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
-            "  Normalize audio: {}",
+            "  Normalize: {}",
             if app.normalize_audio { "ON" } else { "OFF" }
         )),
         Line::from(""),

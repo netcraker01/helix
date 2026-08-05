@@ -4,14 +4,18 @@
 //! business logic; this struct only tracks what the renderer needs.
 
 use crossterm::event::KeyCode;
+use jellyx_engine::audio_backend::AudioBackend;
 use jellyx_engine::library_service::LibraryService;
 use jellyx_engine::local_track::LocalTrackRepository;
+use jellyx_engine::playback_models::PlaybackState;
 use jellyx_engine::preferences::PreferencesRepository;
 use jellyx_engine::settings_service::SettingsService;
 use jellyx_engine::sqlite::SqliteHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::audio::TuiAudioBackend;
 
 /// Which tab/view is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +65,13 @@ fn db_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("jellyx").join("jellyx.db"))
 }
 
+/// A track entry for the library view.
+pub struct TrackEntry {
+    pub title: String,
+    pub artist: String,
+    pub local_path: Option<String>,
+}
+
 /// Top-level application state.
 pub struct App {
     pub view: View,
@@ -69,10 +80,14 @@ pub struct App {
     pub db: Option<SqliteHandle>,
     pub library: Option<LibraryService>,
     pub settings: Option<SettingsService>,
-    pub local_tracks: Vec<String>,
+    pub tracks: Vec<TrackEntry>,
+    pub selected_track: usize,
     pub source_settings: Vec<(String, bool)>,
     pub normalize_audio: bool,
     pub telemetry_enabled: bool,
+    pub audio: TuiAudioBackend,
+    pub playback_state: PlaybackState,
+    pub volume: f32,
 }
 
 impl App {
@@ -80,14 +95,18 @@ impl App {
         let mut app = Self {
             view: View::Library,
             running: true,
-            message: "Welcome to Jellyx TUI — q to quit, Tab to switch".into(),
+            message: "Welcome to Jellyx TUI — q quit, Tab switch, Enter play".into(),
             db: None,
             library: None,
             settings: None,
-            local_tracks: Vec::new(),
+            tracks: Vec::new(),
+            selected_track: 0,
             source_settings: Vec::new(),
             normalize_audio: true,
             telemetry_enabled: false,
+            audio: TuiAudioBackend::new(),
+            playback_state: PlaybackState::Stopped,
+            volume: 1.0,
         };
         app.try_init_engine();
         app
@@ -136,14 +155,18 @@ impl App {
         if let Some(handle) = &self.db {
             let repo = LocalTrackRepository::new(handle.clone());
             if let Ok(rows) = repo.get_all(None) {
-                self.local_tracks = rows
+                self.tracks = rows
                     .into_iter()
                     .filter_map(|r| {
                         serde_json::from_str::<jellyx_core::models::track::Track>(&r.track_json)
                             .ok()
-                            .map(|t| format!("{} — {}", t.artist, t.title))
+                            .map(|t| TrackEntry {
+                                title: t.title,
+                                artist: t.artist,
+                                local_path: t.local_path,
+                            })
                     })
-                    .take(100)
+                    .take(200)
                     .collect();
             }
         }
@@ -177,6 +200,60 @@ impl App {
             KeyCode::Char('r') => {
                 self.refresh_data();
                 self.message = "Data refreshed".into();
+                false
+            }
+            // Playback controls
+            KeyCode::Char(' ') => {
+                match self.playback_state {
+                    PlaybackState::Playing => {
+                        let _ = self.audio.pause();
+                        self.playback_state = PlaybackState::Paused;
+                        self.message = "Paused".into();
+                    }
+                    PlaybackState::Paused => {
+                        let _ = self.audio.resume();
+                        self.playback_state = PlaybackState::Playing;
+                        self.message = "Resumed".into();
+                    }
+                    _ => {}
+                }
+                false
+            }
+            KeyCode::Char('s') => {
+                let _ = self.audio.stop();
+                self.playback_state = PlaybackState::Stopped;
+                self.message = "Stopped".into();
+                false
+            }
+            KeyCode::Up if self.view == View::Library => {
+                if self.selected_track > 0 {
+                    self.selected_track -= 1;
+                }
+                false
+            }
+            KeyCode::Down if self.view == View::Library => {
+                if self.selected_track + 1 < self.tracks.len() {
+                    self.selected_track += 1;
+                }
+                false
+            }
+            KeyCode::Enter if self.view == View::Library => {
+                if let Some(track) = self.tracks.get(self.selected_track) {
+                    if let Some(ref path) = track.local_path {
+                        match self.audio.play_local(std::path::Path::new(path)) {
+                            Ok(()) => {
+                                self.playback_state = PlaybackState::Playing;
+                                self.message =
+                                    format!("Playing: {} — {}", track.artist, track.title);
+                            }
+                            Err(e) => {
+                                self.message = format!("Playback error: {e:?}");
+                            }
+                        }
+                    } else {
+                        self.message = "No local path for this track".into();
+                    }
+                }
                 false
             }
             _ => false,

@@ -17,3 +17,7 @@ crossterm = "0.29"
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+cpal = "0.15"
+symphonia = { version = "0.6", features = ["mp3", "isomp4", "aac", "ogg", "vorbis", "flac", "wav", "pcm"] }
+symphonia-core = "0.6"
+crossbeam-channel = "0.5"

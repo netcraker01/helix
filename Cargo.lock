@@ -2433,6 +2433,8 @@ dependencies = [
 name = "jellyx-cli"
 version = "0.4.3"
 dependencies = [
+ "cpal",
+ "crossbeam-channel",
  "crossterm",
  "dirs 5.0.1",
  "jellyx-core",
@@ -2440,6 +2442,8 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "symphonia",
+ "symphonia-core",
 ]
 
 [[package]]
