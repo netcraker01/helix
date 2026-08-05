@@ -16,6 +16,7 @@ pub mod playlist_tracks;
 pub mod preferences;
 pub mod settings;
 pub mod sqlite;
+pub mod suggestions;
 pub mod updater;
 pub mod user_playlists;
 pub mod watched_folder;
