@@ -138,6 +138,24 @@ impl HistoryRepository {
         conn.execute("DELETE FROM history", [])?;
         Ok(())
     }
+
+    /// Get play counts grouped by track_id.
+    pub fn play_counts(&self) -> Result<std::collections::HashMap<String, u32>, rusqlite::Error> {
+        let conn = self.db.lock().map_err(|_| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERNAL),
+                Some("sqlite connection lock poisoned".to_string()),
+            )
+        })?;
+        let mut stmt = conn.prepare("SELECT track_id, COUNT(*) FROM history GROUP BY track_id")?;
+        let counts = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(counts)
+    }
 }
 
 #[cfg(test)]

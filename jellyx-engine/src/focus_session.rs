@@ -40,6 +40,16 @@ pub struct FocusCaptureRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusPreferencesRow {
+    pub default_workflow: String,
+    pub work_duration_ms: i64,
+    pub break_duration_ms: i64,
+    pub rounds: i32,
+    pub music_strategy: String,
+    pub music_value: Option<String>,
+}
+
 const SESSION_SELECT: &str = "SELECT id, intention, goal, first_action, workflow, work_duration_ms, \
      break_duration_ms, rounds, round, phase, state, phase_started_at, \
      phase_deadline_at, paused_remaining_ms, revision, music_strategy, \
@@ -319,6 +329,74 @@ impl FocusSessionRepository {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn get_preferences(&self) -> Result<FocusPreferencesRow, String> {
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT OR IGNORE INTO focus_preferences (
+                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
+                default_rounds, default_music_strategy, default_music_value, updated_at
+             ) VALUES (1, 'pomodoro', 25000, 5000, 4, 'none', NULL, 0)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT default_workflow, default_work_duration_ms, default_break_duration_ms,
+                    default_rounds, default_music_strategy, default_music_value
+             FROM focus_preferences WHERE id = 1",
+            [],
+            |row| {
+                Ok(FocusPreferencesRow {
+                    default_workflow: row.get(0)?,
+                    work_duration_ms: row.get(1)?,
+                    break_duration_ms: row.get(2)?,
+                    rounds: row.get(3)?,
+                    music_strategy: row.get(4)?,
+                    music_value: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_preferences(
+        &self,
+        workflow: &str,
+        work_duration_ms: i64,
+        break_duration_ms: i64,
+        rounds: i32,
+        music_strategy: &str,
+        music_value: Option<&str>,
+        now_ms: i64,
+    ) -> Result<FocusPreferencesRow, String> {
+        let conn = self.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO focus_preferences (
+                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
+                default_rounds, default_music_strategy, default_music_value, updated_at
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                default_workflow = excluded.default_workflow,
+                default_work_duration_ms = excluded.default_work_duration_ms,
+                default_break_duration_ms = excluded.default_break_duration_ms,
+                default_rounds = excluded.default_rounds,
+                default_music_strategy = excluded.default_music_strategy,
+                default_music_value = excluded.default_music_value,
+                updated_at = excluded.updated_at",
+            params![
+                workflow,
+                work_duration_ms,
+                break_duration_ms,
+                rounds,
+                music_strategy,
+                music_value,
+                now_ms,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        self.get_preferences()
     }
 
     fn load_captures(

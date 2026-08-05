@@ -4,11 +4,11 @@ use super::db::Database;
 
 impl UpdatePreferencesRepository for Database {
     fn update_preferences(&self) -> Result<UpdatePrefs, RepositoryError> {
-        self.engine.update_preferences()
+        self.handle().update_preferences()
     }
 
     fn save_update_preferences(&self, prefs: &UpdatePrefs) -> Result<(), RepositoryError> {
-        self.engine.save_update_preferences(prefs)
+        self.handle().save_update_preferences(prefs)
     }
 }
 

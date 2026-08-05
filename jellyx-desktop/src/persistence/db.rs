@@ -76,6 +76,14 @@ pub struct Database {
 }
 
 impl Database {
+    /// Returns a clone of the shared SQLite handle.
+    ///
+    /// Used by trait implementations in sibling modules that need to delegate
+    /// to engine repositories (which take `SqliteHandle` by value).
+    pub fn handle(&self) -> SqliteHandle {
+        self.conn.clone()
+    }
+
     /// Open (or create) the database at the given path.
     ///
     /// Creates parent directories if needed, then delegates to
@@ -272,7 +280,7 @@ impl Database {
     /// (all fields `None`) when no row exists yet (fresh install).
     pub fn get_update_prefs(&self) -> Result<UpdatePrefs, PersistenceError> {
         use jellyx_engine::updater::UpdatePreferencesRepository;
-        self.engine
+        self.conn
             .update_preferences()
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
@@ -280,7 +288,7 @@ impl Database {
     /// Persist the updater prefs (insert or replace the single row).
     pub fn save_update_prefs(&self, prefs: &UpdatePrefs) -> Result<(), PersistenceError> {
         use jellyx_engine::updater::UpdatePreferencesRepository;
-        self.engine
+        self.conn
             .save_update_preferences(prefs)
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
@@ -288,7 +296,7 @@ impl Database {
     /// Returns false unless the user has explicitly persisted consent.
     pub fn get_telemetry_enabled(&self) -> Result<bool, PersistenceError> {
         use jellyx_engine::preferences::PreferencesRepository;
-        self.engine
+        self.conn
             .telemetry_enabled()
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
@@ -297,7 +305,7 @@ impl Database {
     /// migration or by a configured DSN.
     pub fn set_telemetry_enabled(&self, enabled: bool) -> Result<(), PersistenceError> {
         use jellyx_engine::preferences::PreferencesRepository;
-        self.engine
+        self.conn
             .set_telemetry_enabled(enabled)
             .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
@@ -308,12 +316,14 @@ impl Database {
         })?;
         let repo = HistoryRepository::new(self.conn.clone());
         repo.insert(&track.id, &track_json)
-            .map_err(PersistenceError::DatabaseError)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     pub fn get_history(&self) -> Result<Vec<HistoryEntry>, PersistenceError> {
         let repo = HistoryRepository::new(self.conn.clone());
-        let rows = repo.get().map_err(PersistenceError::DatabaseError)?;
+        let rows = repo
+            .get()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         rows.into_iter()
             .map(|row| {
                 let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
@@ -335,7 +345,7 @@ impl Database {
         let repo = HistoryRepository::new(self.conn.clone());
         let rows = repo
             .get_with_limit(limit)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         rows.into_iter()
             .map(|row| {
                 let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
@@ -354,7 +364,7 @@ impl Database {
         let repo = HistoryRepository::new(self.conn.clone());
         let rows = repo
             .get_recent_unique(limit)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         rows.into_iter()
             .map(|row| {
                 let track: Track = serde_json::from_str(&row.track_json).map_err(|e| {
@@ -371,7 +381,8 @@ impl Database {
 
     pub fn clear_history(&self) -> Result<(), PersistenceError> {
         let repo = HistoryRepository::new(self.conn.clone());
-        repo.clear().map_err(PersistenceError::DatabaseError)
+        repo.clear()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     /// Get the current schema version.
@@ -668,32 +679,9 @@ impl Database {
     pub fn get_track_play_counts(
         &self,
     ) -> Result<std::collections::HashMap<String, u32>, PersistenceError> {
-        let conn = self.conn.lock().map_err(|e| {
-            PersistenceError::DatabaseError(format!("failed to lock database: {}", e))
-        })?;
-
-        let mut stmt = conn
-            .prepare("SELECT track_id, COUNT(*) FROM history GROUP BY track_id")
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!(
-                    "failed to prepare play count query: {}",
-                    e
-                ))
-            })?;
-
-        let counts = stmt
-            .query_map([], |row| {
-                let track_id: String = row.get(0)?;
-                let count: u32 = row.get(1)?;
-                Ok((track_id, count))
-            })
-            .map_err(|e| {
-                PersistenceError::DatabaseError(format!("failed to query play counts: {}", e))
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
-
-        Ok(counts)
+        let repo = HistoryRepository::new(self.conn.clone());
+        repo.play_counts()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     // ── User Playlists ─────────────────────────────────────────────────
@@ -1051,7 +1039,7 @@ impl Database {
         let repo = FocusSessionRepository::new(self.conn.clone());
         let row = repo
             .get_session(id)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         row.map(focus_row_to_session).transpose()
     }
 
@@ -1059,7 +1047,7 @@ impl Database {
         let repo = FocusSessionRepository::new(self.conn.clone());
         let row = repo
             .get_nonterminal_session()
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         row.map(focus_row_to_session).transpose()
     }
 
@@ -1067,14 +1055,14 @@ impl Database {
         let repo = FocusSessionRepository::new(self.conn.clone());
         let rows = repo
             .list_sessions(limit)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         rows.into_iter().map(focus_row_to_session).collect()
     }
 
     pub fn focus_delete_session(&self, id: &str) -> Result<(), PersistenceError> {
         let repo = FocusSessionRepository::new(self.conn.clone());
         repo.delete_session(id)
-            .map_err(PersistenceError::DatabaseError)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     pub fn focus_capture(
@@ -1087,7 +1075,7 @@ impl Database {
         let repo = FocusSessionRepository::new(self.conn.clone());
         let row = repo
             .insert_capture(session_id, kind, body, created_at)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         Ok(FocusCapture {
             id: row.id,
             session_id: row.session_id,
@@ -1104,7 +1092,7 @@ impl Database {
         let repo = FocusSessionRepository::new(self.conn.clone());
         let json = repo
             .get_operation_result(request_id)
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         json.map(|s| serde_json::from_str(&s).map_err(serialization_error))
             .transpose()
     }
@@ -1112,42 +1100,37 @@ impl Database {
     pub fn focus_is_playback_directive(&self, request_id: &str) -> Result<bool, PersistenceError> {
         let repo = FocusSessionRepository::new(self.conn.clone());
         repo.is_playback_directive(request_id)
-            .map_err(PersistenceError::DatabaseError)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     pub fn focus_mark_playback_directive(&self, request_id: &str) -> Result<(), PersistenceError> {
         let repo = FocusSessionRepository::new(self.conn.clone());
         repo.mark_playback_directive(request_id)
-            .map_err(PersistenceError::DatabaseError)
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))
     }
 
     pub fn focus_get_preferences(&self) -> Result<FocusPreferences, PersistenceError> {
-        let defaults = FocusPreferences::default().normalized();
-        let (music_strategy, music_value) = focus_music_parts(&defaults.default_music_strategy);
-        let conn = self.conn.lock().map_err(lock_error)?;
-        conn.execute(
-            "INSERT OR IGNORE INTO focus_preferences (
-                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
-                default_rounds, default_music_strategy, default_music_value, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![
-                focus_name(&defaults.default_workflow)?,
-                defaults.default_cadence.work_duration_ms,
-                defaults.default_cadence.break_duration_ms,
-                defaults.default_cadence.rounds,
-                music_strategy,
-                music_value,
-            ],
-        )
-        .map_err(database_error)?;
-        conn.query_row(
-            "SELECT default_workflow, default_work_duration_ms, default_break_duration_ms,
-                    default_rounds, default_music_strategy, default_music_value
-             FROM focus_preferences WHERE id = 1",
-            [],
-            focus_preferences_from_row,
-        )
-        .map_err(database_error)
+        let repo = FocusSessionRepository::new(self.conn.clone());
+        let row = repo
+            .get_preferences()
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
+        let music_strategy = match (row.music_strategy.as_str(), row.music_value) {
+            ("none", _) => FocusMusicStrategy::None,
+            ("continueCurrent", _) => FocusMusicStrategy::ContinueCurrent,
+            ("preset", Some(value)) => FocusMusicStrategy::Preset(value),
+            ("query", Some(value)) => FocusMusicStrategy::Query(value),
+            _ => FocusMusicStrategy::None,
+        };
+        Ok(FocusPreferences {
+            default_workflow: focus_decode(row.default_workflow).map_err(database_error)?,
+            default_cadence: FocusCadence {
+                work_duration_ms: row.work_duration_ms,
+                break_duration_ms: row.break_duration_ms,
+                rounds: row.rounds,
+            },
+            default_music_strategy: music_strategy,
+        }
+        .normalized())
     }
 
     pub fn focus_set_preferences(
@@ -1157,31 +1140,17 @@ impl Database {
     ) -> Result<FocusPreferences, PersistenceError> {
         let preferences = preferences.normalized();
         let (music_strategy, music_value) = focus_music_parts(&preferences.default_music_strategy);
-        let conn = self.conn.lock().map_err(lock_error)?;
-        conn.execute(
-            "INSERT INTO focus_preferences (
-                id, default_workflow, default_work_duration_ms, default_break_duration_ms,
-                default_rounds, default_music_strategy, default_music_value, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(id) DO UPDATE SET
-                default_workflow = excluded.default_workflow,
-                default_work_duration_ms = excluded.default_work_duration_ms,
-                default_break_duration_ms = excluded.default_break_duration_ms,
-                default_rounds = excluded.default_rounds,
-                default_music_strategy = excluded.default_music_strategy,
-                default_music_value = excluded.default_music_value,
-                updated_at = excluded.updated_at",
-            params![
-                focus_name(&preferences.default_workflow)?,
-                preferences.default_cadence.work_duration_ms,
-                preferences.default_cadence.break_duration_ms,
-                preferences.default_cadence.rounds,
-                music_strategy,
-                music_value,
-                now_ms,
-            ],
+        let repo = FocusSessionRepository::new(self.conn.clone());
+        repo.set_preferences(
+            &focus_name(&preferences.default_workflow)?,
+            preferences.default_cadence.work_duration_ms,
+            preferences.default_cadence.break_duration_ms,
+            preferences.default_cadence.rounds,
+            music_strategy,
+            music_value,
+            now_ms,
         )
-        .map_err(database_error)?;
+        .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         Ok(preferences)
     }
 
@@ -1205,7 +1174,7 @@ impl Database {
                 &session_json,
                 now_ms,
             )
-            .map_err(PersistenceError::DatabaseError)?;
+            .map_err(|e| PersistenceError::DatabaseError(e.to_string()))?;
         serde_json::from_str(&result_json).map_err(serialization_error)
     }
 }
@@ -1316,27 +1285,6 @@ fn focus_row_to_session(
             })
             .collect::<Result<Vec<_>, PersistenceError>>()?,
     })
-}
-
-fn focus_preferences_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusPreferences> {
-    let music_strategy: String = row.get(4)?;
-    let music_value: Option<String> = row.get(5)?;
-    Ok(FocusPreferences {
-        default_workflow: focus_decode(row.get(0)?)?,
-        default_cadence: FocusCadence {
-            work_duration_ms: row.get(1)?,
-            break_duration_ms: row.get(2)?,
-            rounds: row.get(3)?,
-        },
-        default_music_strategy: match (music_strategy.as_str(), music_value) {
-            ("none", _) => FocusMusicStrategy::None,
-            ("continueCurrent", _) => FocusMusicStrategy::ContinueCurrent,
-            ("preset", Some(value)) => FocusMusicStrategy::Preset(value),
-            ("query", Some(value)) => FocusMusicStrategy::Query(value),
-            _ => return Err(rusqlite::Error::InvalidQuery),
-        },
-    }
-    .normalized())
 }
 
 #[cfg(test)]
