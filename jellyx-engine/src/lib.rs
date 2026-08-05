@@ -20,6 +20,7 @@ pub mod playback_models;
 pub mod playlist_service;
 pub mod playlist_tracks;
 pub mod preferences;
+pub mod queue_controller;
 pub mod settings;
 pub mod settings_service;
 pub mod sqlite;
