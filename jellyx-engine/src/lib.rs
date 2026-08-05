@@ -7,6 +7,7 @@
 pub const BOUNDARY_ESTABLISHED: bool = true;
 
 pub mod artist_favorites;
+pub mod dto;
 pub mod focus_session;
 pub mod history;
 pub mod local_track;
