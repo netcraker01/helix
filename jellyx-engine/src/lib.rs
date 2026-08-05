@@ -23,6 +23,7 @@ pub mod preferences;
 pub mod queue_controller;
 pub mod settings;
 pub mod settings_service;
+pub mod source_resolver;
 pub mod sqlite;
 pub mod suggestions;
 pub mod updater;

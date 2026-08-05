@@ -15,15 +15,8 @@
 use crate::audio::AudioError;
 use serde::Serialize;
 
-/// Error type for source resolution failures.
-#[derive(Debug, Clone)]
-pub enum SourceError {
-    NetworkError(String),
-    #[allow(dead_code)]
-    ResolveError(String),
-    UnsupportedSource,
-    DependencyMissing(String),
-}
+// Re-export SourceError from the engine.
+pub use jellyx_engine::source_resolver::SourceError;
 
 /// Playback state errors.
 #[derive(Debug)]
