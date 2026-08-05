@@ -74,6 +74,8 @@ pub struct TrackEntry {
     pub title: String,
     pub artist: String,
     pub local_path: Option<String>,
+    pub source: jellyx_core::models::source::Source,
+    pub source_id: String,
 }
 
 /// A playlist entry for the playlists view.
@@ -88,6 +90,8 @@ pub struct PlaylistTrackEntry {
     pub title: String,
     pub artist: String,
     pub local_path: Option<String>,
+    pub source: jellyx_core::models::source::Source,
+    pub source_id: String,
 }
 
 /// A remote track from YouTube/SoundCloud search.
@@ -231,6 +235,8 @@ impl App {
                                 title: t.title,
                                 artist: t.artist,
                                 local_path: t.local_path,
+                                source: t.source,
+                                source_id: t.source_id,
                             })
                     })
                     .take(200)
@@ -498,7 +504,9 @@ impl App {
             let title = track.title.clone();
             let artist = track.artist.clone();
             let path = track.local_path.clone();
-            self.play_track(&title, &artist, path.as_deref());
+            let source = track.source.clone();
+            let source_id = track.source_id.clone();
+            self.play_track(&title, &artist, path.as_deref(), &source, &source_id);
         }
     }
 
@@ -507,12 +515,22 @@ impl App {
             let title = track.title.clone();
             let artist = track.artist.clone();
             let path = track.local_path.clone();
-            self.play_track(&title, &artist, path.as_deref());
+            let source = track.source.clone();
+            let source_id = track.source_id.clone();
+            self.play_track(&title, &artist, path.as_deref(), &source, &source_id);
         }
     }
 
-    fn play_track(&mut self, title: &str, artist: &str, local_path: Option<&str>) {
+    fn play_track(
+        &mut self,
+        title: &str,
+        artist: &str,
+        local_path: Option<&str>,
+        source: &jellyx_core::models::source::Source,
+        source_id: &str,
+    ) {
         if let Some(path) = local_path {
+            // Local file — play directly
             match self.audio.play_local(std::path::Path::new(path)) {
                 Ok(()) => {
                     self.playback_state = PlaybackState::Playing;
@@ -524,7 +542,27 @@ impl App {
                 }
             }
         } else {
-            self.message = "No local path for this track".into();
+            // Remote track — resolve stream URL and play
+            self.message = format!("Resolving stream: {artist} — {title}...");
+            match self.sources.resolve_stream_url(source, source_id) {
+                Ok(url) => {
+                    self.message = "Stream resolved, downloading...".into();
+                    match self.audio.play(&url) {
+                        Ok(()) => {
+                            self.playback_state = PlaybackState::Playing;
+                            self.now_playing = Some(format!("{artist} — {title}"));
+                            self.message =
+                                format!("Playing: {}", self.now_playing.as_ref().unwrap());
+                        }
+                        Err(e) => {
+                            self.message = format!("Stream error: {e:?}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.message = format!("Resolve error: {e}");
+                }
+            }
         }
     }
 
@@ -542,6 +580,8 @@ impl App {
                         title: t.track.title.clone(),
                         artist: t.track.artist.clone(),
                         local_path: t.track.local_path.clone(),
+                        source: t.track.source.clone(),
+                        source_id: t.track.source_id.clone(),
                     })
                     .collect();
                 self.selected_playlist_track = 0;
