@@ -2,11 +2,11 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const version = '0.4.3';
+const version = '0.4.4';
 const root = resolve(process.cwd(), '..');
 
 describe('release version', () => {
-  it('keeps app, workspace, UI, and lock entries at the v0.4.3 release version', () => {
+  it('keeps app, workspace, UI, and lock entries at the v0.4.4 release version', () => {
     for (const file of [
       'Cargo.toml',
       'jellyx-desktop/Cargo.toml',
