@@ -41,6 +41,7 @@ import { t } from '@i18n';
 import {
   cacheRemoteStream,
   prefetchNextStream,
+  reResolveStream,
   reportRemoteAudioPlaybackFailure,
   reportRemoteAudioPlaybackRuntimeFailure,
   reportRemoteAudioPlaybackSuccess,
@@ -75,8 +76,12 @@ let audioEl: HTMLAudioElement | null = null;
 
 /** Web Audio context kept alive across tracks (never closed on stop). */
 let audioCtx: AudioContext | null = null;
-/** Media element source bound to audioEl. Created ONCE per element lifetime. */
+/** Media element source bound to the analysed element. Created ONCE per element lifetime. */
 let mediaSource: MediaElementAudioSourceNode | null = null;
+/** The element mediaSource is bound to (primary on non-Linux, clone on Linux).
+ *  Used by stopRemote to decide whether to tear down the chain (clone) or keep
+ *  it alive across tracks (primary — createMediaElementSource is one-shot). */
+let mediaSourceBoundEl: HTMLAudioElement | null = null;
 /** Gain node for remote playback volume/mute when routed through Web Audio. */
 let gainNode: GainNode | null = null;
 /** Analyser node used for frequency-bin extraction. */
@@ -89,6 +94,34 @@ let fftRafId: number | null = null;
 let fftByteBins: Uint8Array<ArrayBuffer> | null = null;
 /** Reusable Float32Array for publishing to the frequencyData store. */
 let fftFloatBins: Float32Array | null = null;
+
+// ── Linux/WebKitGTK cloned-element FFT tap ──────────────────────────
+// On Linux/WebKitGTK, `createMediaElementSource(audioEl)` reroutes the
+// element's output exclusively into the Web Audio graph and SILENCES the
+// element's native <audio> output. A prior fix restored audibility by
+// bypassing the Web Audio graph entirely for remote playback on Linux,
+// which also zeroed out remote FFT/visualizer data.
+//
+// To keep BOTH audible remote audio AND working remote visualizers on
+// Linux, we keep the primary `audioEl` on its native direct-output path
+// (audible) and analyse a SEPARATE hidden cloned <audio> element that
+// shares the same proxied `src`. The clone is routed through
+// `createMediaElementSource` → `AnalyserNode` and is NOT connected to
+// `audioCtx.destination`, so it produces no sound of its own — it only
+// feeds the analyser. Play/pause and currentTime are synced from the
+// primary element so the analyser sees the same audio the user hears.
+//
+// The clone is created lazily on first Linux remote load and reused for
+// the element's lifetime. Each new track updates the clone's `src`
+// alongside the primary's.
+
+/** Hidden cloned <audio> used ONLY for FFT analysis on Linux/WebKitGTK.
+ *  null on non-Linux platforms and before the first Linux remote load. */
+let analyserAudioEl: HTMLAudioElement | null = null;
+/** Whether the cloned-element tap has been bound to a MediaElementSource. */
+let analyserCloneBound = false;
+/** Syncs play/pause + currentTime from the primary element to the clone. */
+let cloneSyncUnlisten: (() => void) | null = null;
 
 /** Convert one Web Audio analyser read into the same contract as Rust FFT events. */
 export function readAnalyserFrame(
@@ -139,17 +172,76 @@ export function proxyLocalUrl(port: number | null, capability: string | undefine
   return `http://127.0.0.1:${port}/proxy?cap=${encodeURIComponent(capability)}&url=${encodeURIComponent(fileUrl)}`;
 }
 
+/** Set up the Linux/WebKitGTK analysis tap: create (once) a hidden cloned
+ *  <audio> sharing the primary element's src, bind it to a
+ *  MediaElementSource → AnalyserNode NOT connected to destination, and
+ *  wire play/pause + currentTime sync from the primary to the clone.
+ *
+ *  The primary element keeps its native direct output (audible); the clone
+ *  only feeds the analyser (inaudible). Safe to call on every Linux remote
+ *  load — the clone + Web Audio chain are created once and reused.
+ *
+ *  IMPORTANT: `preferredSrc`, when provided, is set on the clone BEFORE
+ *  creating the Web Audio chain. This is critical on WebKitGTK, where
+ *  `createMediaElementSource(clone)` requires the element to already have
+ *  a valid src — calling it with an empty src produces a broken
+ *  MediaElementSource that never feeds the AnalyserNode. */
+function ensureLinuxAnalyserTap(primary: HTMLAudioElement, preferredSrc?: string): void {
+  const clone = ensureAnalyserClone(primary);
+  if (!clone) return;
+  // Prefer the explicit URL when provided (loadRemoteStream sets this from
+  // the computed playable URL before the primary's audio.src gets it).
+  // Otherwise sync from the primary, but ONLY when primary.src is non-empty
+  // — copying an empty src would wipe the clone's loaded source.
+  if (preferredSrc && clone.src !== preferredSrc) {
+    clone.src = preferredSrc;
+  } else if (primary.src && clone.src !== primary.src) {
+    clone.src = primary.src;
+  }
+  if (!analyserCloneBound) {
+    // Build the Web Audio chain on the clone. connectToDestination=false
+    // so the clone produces no sound; the primary element is audible.
+    ensureWebAudioChain(clone, false);
+    analyserCloneBound = mediaSource != null;
+  }
+  if (analyserCloneBound) {
+    attachCloneSync(primary, clone);
+  }
+}
+
 /** Lazily create the AudioContext + MediaElementSource + AnalyserNode.
  *  `createMediaElementSource` can only be called ONCE per element —
  *  after that the source is permanently bound — so we create the chain
- *  on the first track and keep it alive for the element's lifetime. */
-function ensureWebAudioChain(el: HTMLAudioElement): void {
-  if (mediaSource) return; // already bound to this element
+ *  on the first track and keep it alive for the element's lifetime.
+ *
+ *  `el` is the element to analyse: the primary `audioEl` on non-Linux
+ *  (also routed to `destination` for audible Web Audio output), or the
+ *  hidden cloned analysis element on Linux (NOT routed to `destination`
+ *  — the primary element provides audible direct output, the clone only
+ *  feeds the analyser). */
+function ensureWebAudioChain(el: HTMLAudioElement, connectToDestination: boolean): void {
+  if (mediaSource && mediaSourceBoundEl === el) return; // already bound to THIS element
+  if (mediaSource && mediaSourceBoundEl !== el) {
+    // Bound to a different element (e.g. a previous clone, or a platform
+    // switch in tests). Tear down the stale chain before rebinding.
+    stopAnalyserReactivity?.();
+    stopAnalyserReactivity = null;
+    if (audioCtx && typeof audioCtx.close === 'function') { audioCtx.close().catch(() => {}); }
+    audioCtx = null;
+    mediaSource = null;
+    mediaSourceBoundEl = null;
+    gainNode = null;
+    analyser = null;
+    fftByteBins = null;
+    fftFloatBins = null;
+    analyserCloneBound = false;
+  }
   const Ctx = window.AudioContext || (window as any).webkitAudioContext;
   if (!Ctx) return; // WebKitGTK without Web Audio — gracefully no-op
   audioCtx = new Ctx();
   try {
     mediaSource = audioCtx.createMediaElementSource(el);
+    mediaSourceBoundEl = el;
   } catch {
     // Source may already be bound (HMR edge case) — bail out safely.
     mediaSource = null;
@@ -157,19 +249,118 @@ function ensureWebAudioChain(el: HTMLAudioElement): void {
     return;
   }
   gainNode = audioCtx.createGain();
-  gainNode.gain.value = Math.max(0, Math.min(1, get(volume) / 100));
+  // On Linux the clone's gainNode only feeds the analyser (not destination),
+  // so keep it at unity so the visualizer sees the true signal regardless of
+  // the user's volume setting. On non-Linux the gainNode also drives audible
+  // output, so initialise it to the current volume.
+  gainNode.gain.value = connectToDestination ? Math.max(0, Math.min(1, get(volume) / 100)) : 1;
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = REMOTE_FFT_SIZE;
   stopAnalyserReactivity?.();
+  // Reactivity slider controls AnalyserNode smoothing on ALL platforms.
+  // Previously Linux was hardcoded to 0; the AnalyserNode is the primary FFT
+  // source for remote streams and needs proper smoothing.
   stopAnalyserReactivity = visualizerReactivity.subscribe((reactivity) => {
     if (analyser) analyser.smoothingTimeConstant = reactivityToSmoothing(reactivity);
   });
   mediaSource.connect(gainNode);
   gainNode.connect(analyser);
-  analyser.connect(audioCtx.destination);
+  // On Linux the clone must NOT be connected to destination — the primary
+  // element already produces audible direct output, and connecting the
+  // clone would double the audio. On non-Linux the primary element IS
+  // the analysed element and MUST be connected to destination to be heard.
+  if (connectToDestination) {
+    analyser.connect(audioCtx.destination);
+  } else {
+    // Linux clone: connect analyser → silentGain(0) → destination.
+    // WebKitGTK does NOT process a Web Audio graph that has no path to
+    // destination — the AnalyserNode would receive stale or zero data.
+    // A zero-gain node keeps the graph alive (data flows through) without
+    // producing any audible output, so the clone stays inaudible while
+    // the AnalyserNode gets real-time frequency data.
+    const silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+    analyser.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
+  }
   // Pre-allocate reusable buffers (half the FFT size = Nyquist bins).
   fftByteBins = new Uint8Array(analyser.frequencyBinCount);
   fftFloatBins = new Float32Array(analyser.frequencyBinCount);
+}
+
+/** Lazily create the hidden cloned <audio> used for FFT analysis on
+ *  Linux/WebKitGTK. The clone shares the primary element's src and
+ *  crossOrigin so it sees the same CORS-un-tainted proxied stream. */
+function ensureAnalyserClone(primary: HTMLAudioElement): HTMLAudioElement | null {
+  if (analyserAudioEl) return analyserAudioEl;
+  const clone = document.createElement('audio');
+  clone.preload = 'auto';
+  clone.crossOrigin = 'anonymous';
+  // The clone is never connected to destination, so it is inaudible.
+  // Muting it as a belt-and-suspenders guard against any environment that
+  // somehow routes a cloned media element to the default output.
+  clone.muted = true;
+  // Keep the clone out of the layout and a11y tree.
+  clone.setAttribute('aria-hidden', 'true');
+  clone.style.position = 'fixed';
+  clone.style.width = '0';
+  clone.style.height = '0';
+  clone.style.opacity = '0';
+  clone.style.pointerEvents = 'none';
+  document.body.appendChild(clone);
+  analyserAudioEl = clone;
+  return clone;
+}
+
+/** Sync play/pause + currentTime from the primary audio element to the
+ *  Linux analysis clone so the analyser inspects the same audio the user
+ *  hears. Idempotent: safe to call multiple times (only the latest
+ *  listener set is kept).
+ *
+ *  IMPORTANT: this function does NOT use periodic timers or playbackRate
+ *  adjustments. On WebKitGTK, accessing `currentTime` or `playbackRate`
+ *  on a playing <audio> element can trigger a synchronous IPC to the
+ *  GStreamer pipeline, blocking the main thread for 10-100+ ms. A
+ *  periodic timer (setInterval + smoothSync) was found to drop rAF
+ *  frame rate from 60fps to 6-15fps.
+ *
+ *  Instead, we only sync on explicit events (play, pause, seeked,
+ *  canplay) — these are naturally rate-limited by the user's actions
+ *  and the stream lifecycle. The clone may drift a few hundred ms over
+ *  several minutes, but the visualizer stays smooth because the
+ *  AnalyserNode buffer is never starved. */
+function attachCloneSync(primary: HTMLAudioElement, clone: HTMLAudioElement): void {
+  cloneSyncUnlisten?.();
+
+  /** Hard-seek the clone to the primary's position. Only called on deliberate
+   *  seeks (user seek, track change, clone source load). */
+  const hardSync = () => {
+    try { clone.currentTime = primary.currentTime; } catch { /* not seekable yet */ }
+  };
+
+  const onPlay = () => {
+    void clone.play().catch(() => {});
+    hardSync();                     // align on start
+  };
+  const onPause = () => { clone.pause(); };
+  // User seek → must hard-seek the clone (AnalyserNode flush unavoidable).
+  const onSeeked = () => { hardSync(); };
+  // New source loaded (track change, cache swap) → hard sync once.
+  const onCanPlay = () => {
+    if (!clone.paused) return;
+    void clone.play().catch(() => {});
+    hardSync();
+  };
+  primary.addEventListener('play', onPlay);
+  primary.addEventListener('pause', onPause);
+  primary.addEventListener('seeked', onSeeked);
+  clone.addEventListener('canplay', onCanPlay);
+  cloneSyncUnlisten = () => {
+    primary.removeEventListener('play', onPlay);
+    primary.removeEventListener('pause', onPause);
+    primary.removeEventListener('seeked', onSeeked);
+    clone.removeEventListener('canplay', onCanPlay);
+  };
 }
 
 /** Start the rAF loop that reads the analyser and publishes FrequencyData.
@@ -276,6 +467,16 @@ interface RemotePlaybackAttempt {
   sourceUrl: string;
   startReported: boolean;
   runtimeReported: boolean;
+  /** Set to true once an expired-URL re-resolve has been started for this attempt;
+   *  prevents re-resolve loops on repeated errors while the fresh URL is loading. */
+  reResolving: boolean;
+}
+
+/** Playback state captured before an expired-URL re-resolve, used to restore
+ *  position and play/pause intent on the fresh source once it loads. */
+interface RecoveryPlaybackState {
+  position: number;
+  shouldPlay: boolean;
 }
 
 let remotePlaybackGeneration = 0;
@@ -299,14 +500,46 @@ function reportAttemptOutcome(attempt: RemotePlaybackAttempt, runtime: boolean, 
   });
 }
 
-function installAttemptErrorHandler(audio: HTMLAudioElement, attempt: RemotePlaybackAttempt): void {
+function installAttemptErrorHandler(
+  audio: HTMLAudioElement,
+  attempt: RemotePlaybackAttempt,
+  track: Track,
+  streamRequestId: number,
+): void {
   removeAttemptErrorHandler?.();
-  const onError = (e: Event) => {
+  const onError = async (e: Event) => {
     if (!isCurrentAttempt(attempt, audio)) return;
     const target = e.target as HTMLAudioElement;
     const errorCode = target.error?.code;
 
     if (seeking || swappingSource || intentionallyStopping) return;
+
+    const mayBeExpiredUrl = errorCode === 2 || errorCode === 4;
+    if (mayBeExpiredUrl && !attempt.reResolving) {
+      attempt.reResolving = true;
+      const recoveryState: RecoveryPlaybackState = {
+        position: Number.isFinite(target.currentTime) ? target.currentTime : 0,
+        shouldPlay: !target.paused || get(isPlaying),
+      };
+      try {
+        const fresh = await reResolveStream(track, streamRequestId);
+        if (!isCurrentAttempt(attempt, audio)) return;
+        if (fresh.streamUrl) {
+          await loadRemoteStreamAttempt(
+            track,
+            fresh.streamUrl,
+            undefined,
+            fresh.proxyCapability,
+            streamRequestId,
+            true,
+            recoveryState,
+          );
+          return;
+        }
+      } catch {
+        // Fall through to the existing failure telemetry and skip behavior.
+      }
+    }
 
     // An error before play() settles is a start failure; a later error is a
     // separate runtime outcome and must remain visible after a successful start.
@@ -440,8 +673,32 @@ function getAudio(): HTMLAudioElement {
  *
  * SoundCloud tracks use the remote proxy URL directly (their seek works).
  */
-export async function loadRemoteStream(track: Track, streamUrl: string, remoteUrl?: string, proxyCapability?: string): Promise<void> {
+export async function loadRemoteStream(
+  track: Track,
+  streamUrl: string,
+  remoteUrl?: string,
+  proxyCapability?: string,
+  streamRequestId: number = 0,
+): Promise<void> {
+  return loadRemoteStreamAttempt(track, streamUrl, remoteUrl, proxyCapability, streamRequestId, false);
+}
+
+/** Internal entry point that carries the re-resolve recovery state.
+ *  `alreadyReResolved` marks attempts triggered by the expired-URL recovery
+ *  path so they don't loop back into another re-resolve if the fresh URL also
+ *  errors. `recoveryState` restores the position and play/pause intent the
+ *  user had before the expired URL was detected. */
+async function loadRemoteStreamAttempt(
+  track: Track,
+  streamUrl: string,
+  remoteUrl: string | undefined,
+  proxyCapability: string | undefined,
+  streamRequestId: number,
+  alreadyReResolved: boolean = false,
+  recoveryState?: RecoveryPlaybackState,
+): Promise<void> {
   selectFftSource('remote');
+  const linuxDirectOutput = typeof navigator !== 'undefined' && /Linux/.test(navigator.userAgent);
   const audio = getAudio();
   // A new attempt supersedes a prior intentional source clear immediately.
   intentionallyStopping = false;
@@ -457,6 +714,7 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
     sourceUrl: '',
     startReported: false,
     runtimeReported: false,
+    reResolving: alreadyReResolved,
   };
   activeRemotePlaybackAttempt = attempt;
 
@@ -464,28 +722,38 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
   audio.pause();
   audio.src = '';
 
-  // Ensure the Web Audio AnalyserNode chain is bound to this audio
-  // element BEFORE we assign a src. createMediaElementSource can only be
-  // called once per element lifetime; subsequent tracks reuse it.
-  ensureWebAudioChain(audio);
+  // Compute the playable URL early — we need it BEFORE creating the Web Audio
+  // chain on Linux so the cloned <audio> has a valid src when
+  // createMediaElementSource binds it. See ensureLinuxAnalyserTap docs.
+  const playableUrl = trackDuration > 0
+    ? appendProxyParam(streamUrl, 'duration', String(trackDuration))
+    : streamUrl;
+
+  if (linuxDirectOutput) {
+    // WebKitGTK/Linux: keep the primary element on its native direct-output
+    // path (audible) and analyse a hidden clone via a MediaElementSource →
+    // AnalyserNode that is NOT connected to destination (inaudible). This
+    // restores remote visualizer data without silencing remote audio.
+    // Pass playableUrl so the clone is correctly set up before the chain.
+    ensureLinuxAnalyserTap(audio, playableUrl);
+  } else {
+    // createMediaElementSource can only be called once per element lifetime.
+    // On non-Linux the primary element IS the analysed element and is
+    // connected to destination so Web Audio owns audible output + volume.
+    ensureWebAudioChain(audio, true);
+  }
 
   // Set playback volume. When the remote track is routed through Web Audio,
   // control loudness via GainNode (audioEl.volume can become ineffective once
   // playback is flowing through createMediaElementSource on some WebKit builds).
-  if (gainNode) {
+  // On Linux the primary element is NOT routed through Web Audio (the clone is),
+  // so the primary's audio.volume must track the user's volume directly.
+  if (!linuxDirectOutput && gainNode) {
     gainNode.gain.value = Math.max(0, Math.min(1, get(volume) / 100));
     audio.volume = 1;
   } else {
     audio.volume = get(volume) / 100;
   }
-  // Give the proxy the known metadata duration so it can expose
-  // X-Content-Duration / Content-Duration on the initial media response. This
-  // is especially important for YouTube m4a streams, where the WebView often
-  // reports `duration = Infinity`; without a finite duration, native seek can
-  // stall or scan slowly.
-  const playableUrl = trackDuration > 0
-    ? appendProxyParam(streamUrl, 'duration', String(trackDuration))
-    : streamUrl;
 
   baseStreamUrl = playableUrl;
   currentStreamUrl = playableUrl;
@@ -494,8 +762,12 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
   // (currentTime) for both YouTube and SoundCloud; the proxy exposes byte-range
   // metadata so the browser's media engine can seek accurately.
   audio.src = playableUrl;
+  // Keep the Linux analysis clone on the same src so the analyser inspects
+  // the same proxied stream the user hears. Safe no-op when no clone exists
+  // (non-Linux, or before the first Linux remote load).
+  if (analyserAudioEl) analyserAudioEl.src = playableUrl;
   attempt.sourceUrl = audio.src;
-  installAttemptErrorHandler(audio, attempt);
+  installAttemptErrorHandler(audio, attempt, track, streamRequestId);
 
   // Start playback from the remote proxy URL immediately.
   // For YouTube, we'll swap to a local file once the cache download completes.
@@ -504,6 +776,22 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
     // A superseded promise can fulfill after a newer attempt has failed.
     if (!isCurrentAttempt(attempt, audio)) return;
     remoteActive.set(true);
+    if (recoveryState) {
+      const restorePlaybackState = () => {
+        audio.currentTime = recoveryState.position;
+        if (recoveryState.shouldPlay) {
+          void audio.play();
+        } else {
+          audio.pause();
+        }
+      };
+      if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        restorePlaybackState();
+      } else {
+        if (!recoveryState.shouldPlay) audio.pause();
+        audio.addEventListener('loadedmetadata', restorePlaybackState, { once: true });
+      }
+    }
     // A fulfilled play() promise confirms that the media element started.
     reportAttemptOutcome(attempt, false, true);
   } catch (e) {
@@ -564,6 +852,7 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
           audio.removeEventListener('error', onSwapError);
           // Restore the proxy URL and playback position.
           audio.src = playableUrl;
+          if (analyserAudioEl) analyserAudioEl.src = playableUrl;
           attempt.sourceUrl = audio.src;
           currentStreamUrl = playableUrl;
           const restorePos = () => {
@@ -604,6 +893,9 @@ export async function loadRemoteStream(track: Track, streamUrl: string, remoteUr
           }
         }, 3000);
         audio.src = localUrl;
+        // Keep the Linux analysis clone on the same source so the analyser
+        // inspects the cached file too (with the same CORS headers).
+        if (analyserAudioEl) analyserAudioEl.src = localUrl;
         currentStreamUrl = localUrl;
         attempt.sourceUrl = audio.src;
       }
@@ -727,7 +1019,8 @@ export function seekRemote(position: number): void {
 export function setRemoteVolume(value: number): void {
   if (audioEl) {
     const normalized = Math.max(0, Math.min(1, value / 100));
-    if (gainNode) {
+    const linuxDirectOutput = typeof navigator !== 'undefined' && /Linux/.test(navigator.userAgent);
+    if (!linuxDirectOutput && gainNode) {
       gainNode.gain.value = normalized;
       audioEl.volume = 1;
     } else {
@@ -786,6 +1079,39 @@ export function stopRemote(): void {
     audioEl.src = '';
     audioEl.load();
   }
+  // Decide whether to tear down the Web Audio chain. The chain is bound to a
+  // specific element (tracked by mediaSourceBoundEl):
+  //  - Clone (Linux): always tear down — the clone is per-load, and the chain
+  //    must be reset so the next Linux load can bind a fresh clone.
+  //  - Primary audioEl (non-Linux): keep the chain alive across tracks —
+  //    createMediaElementSource is one-shot per element, and the primary
+  //    element is reused for every remote track. Resetting would silently
+  //    break the analyser on the next load.
+  const boundEl = mediaSourceBoundEl;
+  const isCloneChain = boundEl != null && boundEl !== audioEl;
+  if (isCloneChain) {
+    cloneSyncUnlisten?.();
+    cloneSyncUnlisten = null;
+    if (analyserAudioEl) {
+      analyserAudioEl.pause();
+      analyserAudioEl.src = '';
+      analyserAudioEl.remove();
+      analyserAudioEl = null;
+    }
+    mediaSource = null;
+    mediaSourceBoundEl = null;
+    gainNode = null;
+    analyser = null;
+    fftByteBins = null;
+    fftFloatBins = null;
+    stopAnalyserReactivity?.();
+    stopAnalyserReactivity = null;
+    if (audioCtx && typeof audioCtx.close === 'function') {
+      audioCtx.close().catch(() => {});
+    }
+    audioCtx = null;
+    analyserCloneBound = false;
+  }
   normalizationActive = false;
   remoteActive.set(false);
   // Reset flag after the browser has processed the src change.
@@ -795,4 +1121,17 @@ export function stopRemote(): void {
 /** Get the current HTMLAudio element (for advanced use). */
 export function getAudioElement(): HTMLAudioElement | null {
   return audioEl;
+}
+
+/** Get the analyser clone's drift from the primary element, in ms.
+ *  Positive means the clone is behind the primary.
+ *  Returns NaN when the clone or primary is unavailable. */
+export function getAnalyserDriftMs(): number {
+  if (!analyserAudioEl || !audioEl) return NaN;
+  return (audioEl.currentTime - analyserAudioEl.currentTime) * 1000;
+}
+
+/** Get the current AnalyserNode, if active. Used for diagnostics. */
+export function getAnalyserNode(): AnalyserNode | null {
+  return analyser;
 }

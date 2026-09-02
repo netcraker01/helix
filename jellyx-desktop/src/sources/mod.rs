@@ -39,12 +39,28 @@ pub trait SourceResolver: Send + Sync {
     /// only need the playable stream URL. The default implementation delegates
     /// to `resolve()` and extracts `stream_url`; resolvers should override this
     /// with a lighter-weight command (e.g. `--print %(url)s`) when possible.
+    #[allow(dead_code)]
     fn resolve_stream_url(&self, id: &str) -> Result<String, SourceError> {
+        self.resolve_stream_url_with_refresh(id, false)
+    }
+
+    /// Resolve only the stream URL, optionally bypassing the resolver cache.
+    /// Resolvers with a signed/expiring upstream URL override this to honour
+    /// `force_refresh=true` (re-run the lightweight resolve command); the
+    /// default implementation ignores the flag and delegates to `resolve()`.
+    fn resolve_stream_url_with_refresh(
+        &self,
+        id: &str,
+        _force_refresh: bool,
+    ) -> Result<String, SourceError> {
         let track = self.resolve(id)?;
         track
             .stream_url
             .ok_or_else(|| SourceError::ResolveError("no stream URL".into()))
     }
+
+    /// Remove a cached stream URL entry. Resolvers without a cache need no action.
+    fn invalidate_stream_cache(&self, _id: &str) {}
 
     /// Search for playlists matching the given query.
     /// Default implementation returns an empty list — resolvers that
@@ -176,12 +192,33 @@ impl SourceRegistry {
     /// Routes to the first resolver matching the given source type. This is the
     /// fast path used by `play_stream()` when the Track metadata is already known.
     pub fn resolve_stream_url(&self, source: &Source, id: &str) -> Result<String, SourceError> {
+        self.resolve_stream_url_with_refresh(source, id, false)
+    }
+
+    /// Resolve a stream URL and optionally force the matching resolver to refresh it.
+    pub fn resolve_stream_url_with_refresh(
+        &self,
+        source: &Source,
+        id: &str,
+        force_refresh: bool,
+    ) -> Result<String, SourceError> {
         for resolver in &self.resolvers {
             if resolver.source_type() == *source {
-                return resolver.resolve_stream_url(id);
+                return resolver.resolve_stream_url_with_refresh(id, force_refresh);
             }
         }
         Err(SourceError::UnsupportedSource)
+    }
+
+    /// Remove a cached URL from the resolver that owns the source.
+    pub fn invalidate_stream_cache(&self, source: &Source, id: &str) {
+        if let Some(resolver) = self
+            .resolvers
+            .iter()
+            .find(|resolver| resolver.source_type() == *source)
+        {
+            resolver.invalidate_stream_cache(id);
+        }
     }
 
     /// Try to resolve a track ID through every registered resolver.

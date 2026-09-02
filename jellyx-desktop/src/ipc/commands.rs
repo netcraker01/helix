@@ -468,6 +468,40 @@ pub fn report_remote_audio_playback_runtime_failure(elapsed_ms: u64) {
     record_remote_audio_playback("audio_runtime", elapsed_ms, false);
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReResolvedStream {
+    stream_url: String,
+    proxy_capability: Option<String>,
+}
+
+/// Re-resolve a remote stream URL while bypassing resolver caches.
+///
+/// Invoked by the frontend remote player when the `<audio>` element reports a
+/// network/source error consistent with an expired signed CDN URL. The command
+/// drops the cached stream URL for the track and re-runs the lightweight
+/// resolver with `force_refresh=true`, then returns the proxy-routed URL plus
+/// the proxy capability the frontend needs for the local-cache swap path.
+#[tauri::command]
+pub async fn re_resolve_stream(
+    state: tauri::State<'_, AppState>,
+    track: Track,
+    stream_request_id: u64,
+) -> Result<ReResolvedStream, AppError> {
+    let playback = state.playback.clone();
+    let (stream_url, proxy_capability) =
+        tokio::task::spawn_blocking(move || playback.re_resolve_stream(track, stream_request_id))
+            .await
+            .map_err(|e| AppError {
+                code: "INTERNAL_ERROR".into(),
+                details: Some(format!("re_resolve_stream task join error: {}", e)),
+            })??;
+    Ok(ReResolvedStream {
+        stream_url,
+        proxy_capability,
+    })
+}
+
 #[tauri::command]
 pub fn open_mini_player(app: tauri::AppHandle) -> Result<(), AppError> {
     if let Some(main_window) = app.get_webview_window("main") {

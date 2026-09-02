@@ -276,6 +276,16 @@ export function prefetchNextStream(): Promise<void> {
   return invokeCommand<void>('prefetch_next_stream');
 }
 
+/** Re-resolve a track's stream URL, bypassing the resolver cache.
+ *
+ *  Used by the remote player to recover from an expired signed CDN URL: the
+ *  backend drops the cached stream URL and re-runs the lightweight resolver
+ *  with `force_refresh=true`. Returns the proxy-routed `streamUrl` plus the
+ *  proxy capability the frontend needs for the local-cache swap path. */
+export function reResolveStream(track: Track, streamRequestId: number): Promise<{ streamUrl: string; proxyCapability?: string }> {
+  return invokeCommand<{ streamUrl: string; proxyCapability?: string }>('re_resolve_stream', { track, streamRequestId });
+}
+
 // ── User Playlist commands ────────────────────────────────────────
 
 export function createPlaylist(title: string): Promise<UserPlaylist> {

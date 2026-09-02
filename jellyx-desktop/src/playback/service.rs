@@ -991,6 +991,35 @@ impl<R: tauri::Runtime> PlaybackService<R> {
         Ok(())
     }
 
+    /// Re-resolve a remote stream URL after the browser reports an expired source.
+    ///
+    /// Used by the `re_resolve_stream` Tauri command when the remote audio
+    /// element fires a `MEDIA_ERR_NETWORK` / `MEDIA_ERR_SRC_NOT_SUPPORTED` error
+    /// that is consistent with an expired signed CDN URL (YouTube/SoundCloud).
+    /// Invalidates the resolver's cached stream URL for this track and re-runs
+    /// the lightweight resolve with `force_refresh=true` so the next playback
+    /// attempt uses a fresh, unexpired URL. Returns the proxy-routed `stream_url`
+    /// (suitable for the frontend's `<audio>` element) and the proxy capability
+    /// the frontend needs to route cached local files through the same proxy.
+    pub fn re_resolve_stream(
+        &self,
+        track: Track,
+        _stream_request_id: u64,
+    ) -> Result<(String, Option<String>), AppError> {
+        self.sources
+            .invalidate_stream_cache(&track.source, &track.source_id);
+        let remote_url = self
+            .sources
+            .resolve_stream_url_with_refresh(&track.source, &track.source_id, true)
+            .map_err(AppError::from)?;
+        let stream_url = stream_url_for_proxy(self.proxy.as_ref(), &remote_url)?;
+        let capability = self
+            .proxy
+            .as_ref()
+            .map(|(_, capability)| capability.clone());
+        Ok((stream_url, capability))
+    }
+
     /// Seek to a position in the current track (seconds).
     ///
     /// Sets the seeking flag to pause the decoder thread, calls

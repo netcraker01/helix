@@ -208,6 +208,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             crate::ipc::commands::report_remote_audio_playback_failure,
             crate::ipc::commands::report_remote_audio_playback_runtime_failure,
             crate::ipc::commands::report_remote_audio_playback_success,
+            crate::ipc::commands::re_resolve_stream,
             crate::ipc::commands::open_mini_player,
             crate::ipc::commands::restore_full_player,
             // Library commands

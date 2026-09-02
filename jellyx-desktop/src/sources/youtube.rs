@@ -450,14 +450,24 @@ impl SourceResolver for YouTubeResolver {
     }
 
     fn resolve_stream_url(&self, id: &str) -> Result<String, SourceError> {
+        self.resolve_stream_url_with_refresh(id, false)
+    }
+
+    fn resolve_stream_url_with_refresh(
+        &self,
+        id: &str,
+        force_refresh: bool,
+    ) -> Result<String, SourceError> {
         Self::check_yt_dlp()?;
 
         // Check cache first — same cache as resolve()
-        if let Ok(cache) = resolve_cache().lock() {
-            if let Some(entry) = cache.get(id) {
-                if entry.cached_at.elapsed() < RESOLVE_CACHE_TTL {
-                    if let Some(url) = &entry.track.stream_url {
-                        return Ok(url.clone());
+        if !force_refresh {
+            if let Ok(cache) = resolve_cache().lock() {
+                if let Some(entry) = cache.get(id) {
+                    if entry.cached_at.elapsed() < RESOLVE_CACHE_TTL {
+                        if let Some(url) = &entry.track.stream_url {
+                            return Ok(url.clone());
+                        }
                     }
                 }
             }
@@ -537,6 +547,12 @@ impl SourceResolver for YouTubeResolver {
         }
 
         Ok(stream_url)
+    }
+
+    fn invalidate_stream_cache(&self, id: &str) {
+        if let Ok(mut cache) = resolve_cache().lock() {
+            cache.remove(id);
+        }
     }
 
     fn search_playlists(&self, query: &str) -> Result<Vec<Playlist>, SourceError> {

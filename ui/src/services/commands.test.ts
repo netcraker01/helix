@@ -152,6 +152,18 @@ describe('Grouped search commands', () => {
     expect(isLatestStreamRequest(secondId)).toBe(true);
   });
 
+  it('reResolveStream invokes re_resolve_stream with track and request id', async () => {
+    const expected = { streamUrl: 'http://127.0.0.1:8765/proxy?fresh', proxyCapability: 'cap' };
+    mocks.invokeCommand.mockResolvedValueOnce(expected);
+    const { reResolveStream } = await import('@services/commands');
+    const track = { id: 't1', sourceId: 'yt-id', source: 'YouTube' } as any;
+
+    const result = await reResolveStream(track, 7);
+
+    expect(mocks.invokeCommand).toHaveBeenCalledWith('re_resolve_stream', { track, streamRequestId: 7 });
+    expect(result).toEqual(expected);
+  });
+
   it('resolves a source track without starting playback', async () => {
     const track = { id: 'yt-1', source: 'YouTube', sourceId: 'dQw4w9WgXcQ' } as any;
     mocks.invokeCommand.mockResolvedValueOnce(track);
