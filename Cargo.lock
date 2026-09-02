@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "jellyx-cli"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "crossterm",
  "jellyx-core",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "jellyx-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "dirs 5.0.1",
  "rusqlite",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "jellyx-desktop"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "jellyx-ffi"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "jellyx-core",
  "uniffi",
